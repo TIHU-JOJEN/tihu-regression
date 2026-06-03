@@ -421,6 +421,9 @@ if st.session_state.df is not None:
             if all_bin: model_options.append('PSM-DID')
             if cat_cols and y_type=='continuous':
                 model_options.append('分组面板回归（按分类变量）')
+            if y_type=='continuous':
+                model_options.append('中介效应（X→M→Y）')
+                model_options.append('调节效应（X×M 交互）')
         else:
             if y_type=='binary': model_options=['Logit','Probit','Logit+Probit','LPM（线性概率模型）']
             elif y_type=='ordered': model_options=['Ordered Logit','Ordered Probit']
