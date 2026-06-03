@@ -585,14 +585,7 @@ if st.session_state.df is not None:
                     # 联合显著：所有核心X一起搜索，按最弱|t|排序
                     stxt.text("联合搜索（所有核心X同时显著）...")
                     if dt=='panel' and 'FE+RE' in sel_model:
-                        ols_res=search_ols_joint(core_x,ctrl_pool,amn,amx)
-                        top20=[r['controls'] for r in ols_res[:20]]
-                        sr['joint']=search_panel_joint(core_x,ctrl_pool,amn,amx,preselected_ctrls=top20)
-                        for r in sr['joint']:
-                            for o_r in ols_res:
-                                if set(r['controls'])==set(o_r['controls']):
-                                    r['tstats']=o_r.get('tstats',{}); r['ols_params']=o_r.get('ols_params',{})
-                                    break
+                        sr['joint']=search_panel_joint(core_x,ctrl_pool,amn,amx)[:50]
                     else:
                         sr['joint']=search_ols_joint(core_x,ctrl_pool,amn,amx)[:50]
                     stxt.text(f"联合搜索: {len(sr['joint'])} 个有效组合")
@@ -601,10 +594,7 @@ if st.session_state.df is not None:
                     for cx in core_x:
                         stxt.text(f"搜索 {cx}...")
                         if dt=='panel' and 'FE+RE' in sel_model:
-                            # 两阶段加速：OLS 初筛 → FE+RE 跑 top20
-                            ols_res=search_ols(cx,ctrl_pool,amn,amx)
-                            top20_ctrls=[r['controls'] for r in ols_res[:20]]
-                            sr[cx]=search_panel_full(cx,ctrl_pool,amn,amx,preselected_ctrls=top20_ctrls)
+                            sr[cx]=search_panel_full(cx,ctrl_pool,amn,amx)[:50]
                         else:
                             sr[cx]=search_ols(cx,ctrl_pool,amn,amx)[:50]
                         stxt.text(f"{cx}: {len(sr[cx])} 个有效组合")
