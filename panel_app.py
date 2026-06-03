@@ -421,9 +421,8 @@ if st.session_state.df is not None:
             if all_bin: model_options.append('PSM-DID')
             if cat_cols and y_type=='continuous':
                 model_options.append('分组面板回归（按分类变量）')
-            if y_type=='continuous':
-                model_options.append('中介效应（X→M→Y）')
-                model_options.append('调节效应（X×M 交互）')
+            model_options.append('中介效应（X→M→Y）')
+            model_options.append('调节效应（X×M 交互）')
         else:
             if y_type=='binary': model_options=['Logit','Probit','Logit+Probit','LPM（线性概率模型）']
             elif y_type=='ordered': model_options=['Ordered Logit','Ordered Probit']
@@ -432,9 +431,8 @@ if st.session_state.df is not None:
             else: model_options=['OLS','OLS+稳健SE','Tobit（如被截断）','Heckman（样本选择）']
             model_options.append('PSM（倾向得分匹配）')
             model_options.append('IV/2SLS（工具变量）')
-            if y_type=='continuous':
-                model_options.append('中介效应（X→M→Y）')
-                model_options.append('调节效应（X×M 交互）')
+            model_options.append('中介效应（X→M→Y）')
+            model_options.append('调节效应（X×M 交互）')
             if cat_cols:
                 if y_type in ['continuous','censored']:
                     model_options.append('ANOVA/组间比较（分类变量）')
