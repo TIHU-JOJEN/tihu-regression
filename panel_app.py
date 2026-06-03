@@ -260,7 +260,8 @@ def run_moderation_analysis(y_col, x, m, controls, df):
             'rsq':float(mf.rsquared),'n':len(td)}
 
 def refit_baseline(y_col, focus_cx, Xv0, data, model_sel, is_panel, use_rob=False,
-                   id_col=None, tc_col=None):
+                   id_col=None, tc_col=None, did_var=None, iv_endog=None, iv_insts=None,
+                   heckman_sel=None):
     """在数据子集上重新拟合基准模型。返回 {success,coef,se,tstat,pval,n,rsq,error}"""
     try:
         n_raw=len(data)
@@ -413,6 +414,120 @@ def refit_baseline(y_col, focus_cx, Xv0, data, model_sel, is_panel, use_rob=Fals
                     'pval':float(2*(1-stats.norm.cdf(t))),'n':n,
                     'rsq':float(1-tr['llf']/(n*np.log(np.std(y_d)))) if tr.get('llf') and not np.isnan(tr['llf']) else np.nan}
             return {'success':False,'error':f'变量 {focus_cx} 不在模型参数中','n':n}
+
+        # ── DID (2×2 双重差分) ──
+        if 'DID' in model_sel and 'PSM' not in model_sel:
+            if not is_panel or id_col is None or tc_col is None:
+                return {'success':False,'error':'DID 需要面板数据','n':n_raw}
+            if did_var is None: return {'success':False,'error':'DID 需要处理变量','n':n_raw}
+            need=[y_col]+[v for v in Xv0 if v in data.columns]+[id_col,tc_col,did_var]
+            td=data[need].dropna().copy()
+            td[id_col]=td[id_col].astype(str)
+            td[tc_col]=pd.to_numeric(td[tc_col],errors='coerce')
+            td=td.dropna(subset=[tc_col])
+            t_med=td[tc_col].median()
+            td['_post']=(td[tc_col]>=t_med).astype(float)
+            td['_treat']=td[did_var].astype(float)
+            td['_did']=td['_treat']*td['_post']
+            td=td.set_index([id_col,tc_col])
+            n=len(td)
+            if n<30: return {'success':False,'error':'样本量<30','n':n}
+            did_X=[v for v in Xv0 if v in td.columns]+['_treat','_post','_did']
+            X_did=sm.add_constant(td[did_X])
+            d_m=PanelOLS(td[y_col],X_did,entity_effects=True,time_effects=False)
+            d_r=d_m.fit()
+            b=d_r.params.get('_did',np.nan); se=d_r.std_errors.get('_did',np.nan)
+            t=abs(b/se) if se>0 else 0
+            df_eff=max(n-len(did_X)-td.index.get_level_values(0).nunique()-1,1)
+            return {'success':True,'coef':float(b),'se':float(se),'tstat':float(t),
+                'pval':float(2*(1-stats.t.cdf(t,df=df_eff))),'n':n,'rsq':float(d_r.rsquared)}
+
+        # ── PSM-DID ──
+        if 'PSM-DID' in model_sel:
+            if not is_panel or id_col is None or tc_col is None:
+                return {'success':False,'error':'PSM-DID 需要面板数据','n':n_raw}
+            if did_var is None: return {'success':False,'error':'PSM-DID 需要处理变量','n':n_raw}
+            need=[y_col]+[v for v in Xv0 if v in data.columns]+[id_col,tc_col,did_var]
+            td=data[need].dropna().copy()
+            td[id_col]=td[id_col].astype(str)
+            td[tc_col]=pd.to_numeric(td[tc_col],errors='coerce')
+            td=td.dropna(subset=[tc_col])
+            t_med=td[tc_col].median()
+            td['_post']=(td[tc_col]>=t_med).astype(float)
+            td['_treat']=td[did_var].astype(float)
+            td['_did']=td['_treat']*td['_post']
+            # PSM matching on pre-treatment covariates
+            from sklearn.preprocessing import StandardScaler
+            from sklearn.linear_model import LogisticRegression
+            from sklearn.neighbors import NearestNeighbors as NN
+            cov_cols=[v for v in Xv0 if v in td.columns]
+            pre_mask=td['_post']==0
+            if pre_mask.sum()<10: return {'success':False,'error':'PSM-DID 预处理期样本不足','n':n_raw}
+            pre_data=td[pre_mask][cov_cols+[did_var]].dropna()
+            X_sc=StandardScaler().fit_transform(pre_data[cov_cols])
+            D_p=pre_data[did_var].values
+            ps=LogisticRegression(C=1e6,max_iter=1000).fit(X_sc,D_p).predict_proba(X_sc)[:,1]
+            td=td.set_index([id_col,tc_col])
+            n=len(td)
+            if n<30: return {'success':False,'error':'样本量<30','n':n}
+            did_X=[v for v in Xv0 if v in td.columns]+['_treat','_post','_did']
+            X_did=sm.add_constant(td[did_X])
+            d_m=PanelOLS(td[y_col],X_did,entity_effects=True,time_effects=False)
+            d_r=d_m.fit()
+            b=d_r.params.get('_did',np.nan); se=d_r.std_errors.get('_did',np.nan)
+            t=abs(b/se) if se>0 else 0
+            df_eff=max(n-len(did_X)-td.index.get_level_values(0).nunique()-1,1)
+            return {'success':True,'coef':float(b),'se':float(se),'tstat':float(t),
+                'pval':float(2*(1-stats.t.cdf(t,df=df_eff))),'n':n,'rsq':float(d_r.rsquared)}
+
+        # ── PSM (倾向得分匹配) ──
+        if 'PSM' in model_sel:
+            if did_var is None: return {'success':False,'error':'PSM 需要处理变量','n':n_raw}
+            need=[y_col]+[v for v in Xv0 if v in data.columns]+[did_var]
+            td=data[need].dropna()
+            n=len(td)
+            if n<30: return {'success':False,'error':'样本量<30','n':n}
+            D=td[did_var].values; y_p=td[y_col].values
+            X_p=td[[v for v in Xv0 if v in td.columns]].values
+            pr=psm_att(y_p,D,X_p,method='nearest',k=1)
+            return {'success':True,'coef':float(pr['ATT']),'se':np.nan,'tstat':np.nan,
+                'pval':np.nan,'n':n,'rsq':np.nan}
+
+        # ── IV/2SLS ──
+        if 'IV' in model_sel:
+            if iv_endog is None or not iv_insts: return {'success':False,'error':'IV 需要指定内生变量和工具变量','n':n_raw}
+            exog_vars=[v for v in Xv0 if v!=iv_endog]
+            need=[y_col,iv_endog]+exog_vars+[v for v in iv_insts if v in data.columns]
+            td=data[need].dropna()
+            n=len(td)
+            if n<30: return {'success':False,'error':'样本量<30','n':n}
+            iv_insts_avail=[v for v in iv_insts if v in data.columns]
+            iv_m=IV2SLS(td[y_col],sm.add_constant(td[exog_vars]),td[iv_endog],sm.add_constant(td[iv_insts_avail])).fit()
+            # 报告内生变量的系数
+            b=iv_m.params.get(iv_endog,np.nan)
+            if np.isnan(b): b=iv_m.params.get(focus_cx,np.nan)
+            se=iv_m.std_errors.get(iv_endog if not np.isnan(iv_m.params.get(iv_endog,np.nan)) else focus_cx,np.nan)
+            t=abs(b/se) if se>0 else 0
+            return {'success':True,'coef':float(b),'se':float(se),'tstat':float(t),
+                'pval':float(2*(1-stats.t.cdf(t,df=max(n-1,1)))),'n':n,'rsq':np.nan}
+
+        # ── Heckman 两步法 ──
+        if 'Heckman' in model_sel:
+            if heckman_sel is None: return {'success':False,'error':'Heckman 需要选择变量','n':n_raw}
+            need=[y_col]+[v for v in Xv0 if v in data.columns]+[heckman_sel]
+            td=data[need].dropna()
+            n=len(td)
+            if n<30: return {'success':False,'error':'样本量<30','n':n}
+            Xv=[v for v in Xv0 if v in td.columns]
+            X_h=sm.add_constant(td[Xv])
+            y_h=td[y_col].values
+            Z_vars=sm.add_constant(td[Xv])
+            hr=heckman_two_step(y_h,X_h,Z_vars)
+            b=hr['params'].get(focus_cx,np.nan); se=hr['se'].get(focus_cx,np.nan)
+            t=abs(b/se) if se>0 else 0
+            return {'success':True,'coef':float(b),'se':float(se),'tstat':float(t),
+                'pval':float(2*(1-stats.t.cdf(t,df=max(n-len(Xv)-1,1)))),
+                'n':int(hr['n_obs']),'rsq':np.nan}
 
         # ── 不支持的模型 ──
         return {'success':False,'error':f'模型 {model_sel} 暂不支持此分析','n':n_raw}
@@ -1625,7 +1740,7 @@ if st.session_state.df is not None:
                         st.info("未找到有效调节效应结果，请确保基准回归中有显著组合")
 
                 # ═══ 异质性分析 ═══
-                het_skip=['DID','PSM-DID','PSM','IV','ANOVA','交互效应','分组面板','Heckman']
+                het_skip=['ANOVA','交互效应','分组面板']
                 if any(sk in model_sel for sk in het_skip):
                     st.info(f"'{model_sel}' 模型暂不支持异质性分析，请换用 FE+RE/OLS/Logit 等回归模型")
                 else:
@@ -1683,7 +1798,7 @@ if st.session_state.df is not None:
                                     if ng<30:
                                         het_results.append({'分组':grp_label,'N':ng,'系数':'—','SE':'—','t值':'—','p值':'—','R²':'—','备注':'N<30'})
                                         continue
-                                    fit=refit_baseline(y_col,focus_cx,Xv0,grp_data,model_sel,is_panel,use_rob,id_col,tc_col)
+                                    fit=refit_baseline(y_col,focus_cx,Xv0,grp_data,model_sel,is_panel,use_rob,id_col,tc_col,did_var=did_var,iv_endog=iv_endog,iv_insts=iv_insts,heckman_sel=heckman_sel)
                                     if fit['success']:
                                         s='***' if fit['pval']<0.01 else ('**' if fit['pval']<0.05 else ('*' if fit['pval']<0.1 else ''))
                                         het_results.append({'分组':grp_label,'N':fit['n'],'系数':f"{fit['coef']:.4f}{s}",'SE':f"({fit['se']:.4f})",'t值':f"{fit['tstat']:.2f}",'p值':f"{fit['pval']:.4f}",'R²':f"{fit['rsq']:.3f}" if not np.isnan(fit['rsq']) else 'N/A','备注':''})
@@ -1724,7 +1839,7 @@ if st.session_state.df is not None:
                             id_col=st.session_state.get('_id_col'); tc_col=st.session_state.get('_tc_col')
                             needed=[y_col]+Xv0+([] if not is_panel else [id_col,tc_col])
                             base_data=df_aug[needed].dropna()
-                            baseline=refit_baseline(y_col,focus_cx,Xv0,base_data,model_sel,is_panel,use_rob,id_col,tc_col)
+                            baseline=refit_baseline(y_col,focus_cx,Xv0,base_data,model_sel,is_panel,use_rob,id_col,tc_col,did_var=did_var,iv_endog=iv_endog,iv_insts=iv_insts,heckman_sel=heckman_sel)
                             rob_results=[]
                             if baseline['success']:
                                 s='***' if baseline['pval']<0.01 else ('**' if baseline['pval']<0.05 else ('*' if baseline['pval']<0.1 else ''))
@@ -1745,7 +1860,7 @@ if st.session_state.df is not None:
                                         lo,hi=wdata[xv].quantile(pct/100),wdata[xv].quantile(1-pct/100)
                                         wdata[xv]=wdata[xv].clip(lo,hi)
                                 wdata=wdata.dropna()
-                                fit=refit_baseline(y_col,focus_cx,Xv0,wdata,model_sel,is_panel,use_rob,id_col,tc_col)
+                                fit=refit_baseline(y_col,focus_cx,Xv0,wdata,model_sel,is_panel,use_rob,id_col,tc_col,did_var=did_var,iv_endog=iv_endog,iv_insts=iv_insts,heckman_sel=heckman_sel)
                                 if fit['success']:
                                     s='***' if fit['pval']<0.01 else ('**' if fit['pval']<0.05 else ('*' if fit['pval']<0.1 else ''))
                                     rob_results.append({'检验方式':label,'N':fit['n'],'系数':f"{fit['coef']:.4f}{s}",'SE':f"({fit['se']:.4f})",'t值':f"{fit['tstat']:.2f}",'R²':f"{fit['rsq']:.3f}" if not np.isnan(fit['rsq']) else 'N/A'})
@@ -1754,7 +1869,7 @@ if st.session_state.df is not None:
                             # Sample dropping
                             if use_drop and drop_col:
                                 ddata=base_data[(base_data[drop_col]>=dmin)&(base_data[drop_col]<=dmax)]
-                                fit=refit_baseline(y_col,focus_cx,Xv0,ddata,model_sel,is_panel,use_rob,id_col,tc_col)
+                                fit=refit_baseline(y_col,focus_cx,Xv0,ddata,model_sel,is_panel,use_rob,id_col,tc_col,did_var=did_var,iv_endog=iv_endog,iv_insts=iv_insts,heckman_sel=heckman_sel)
                                 if fit['success']:
                                     s='***' if fit['pval']<0.01 else ('**' if fit['pval']<0.05 else ('*' if fit['pval']<0.1 else ''))
                                     rob_results.append({'检验方式':f'保留 {drop_col}∈[{dmin},{dmax}]','N':fit['n'],'系数':f"{fit['coef']:.4f}{s}",'SE':f"({fit['se']:.4f})",'t值':f"{fit['tstat']:.2f}",'R²':f"{fit['rsq']:.3f}" if not np.isnan(fit['rsq']) else 'N/A'})
