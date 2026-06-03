@@ -546,6 +546,7 @@ if uploaded is not None:
             else: st.session_state.df=pd.read_excel(uploaded)
             st.session_state.df_name=uploaded.name; st.session_state.data_type=None
             st.session_state.diagnosed=False; st.session_state.search_results=None
+            st.session_state.id_col=None; st.session_state.time_col=None
         except Exception as e: st.error(f"读取失败：{e}"); st.stop()
 
 if st.session_state.df is not None:
@@ -820,6 +821,8 @@ if st.session_state.df is not None:
                 # 准备数据（使用含虚拟变量的增强 dataframe）
                 if dt=='panel':
                     id_col,tc_col=st.session_state.id_col,st.session_state.time_col
+                    if not id_col or not tc_col or id_col not in df_aug.columns or tc_col not in df_aug.columns:
+                        st.error("面板 ID/时间列丢失，请返回 Step 2 重新诊断"); st.stop()
                     use_vars=[id_col,tc_col,y_col]+core_x+ctrl_pool
                     if did_var: use_vars.append(did_var)
                     sub=df_aug[use_vars].dropna().copy()
