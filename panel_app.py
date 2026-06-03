@@ -259,6 +259,167 @@ def run_moderation_analysis(y_col, x, m, controls, df):
             'high_slope':hi_s,'high_se':hi_se,'high_t':hi_t,
             'rsq':float(mf.rsquared),'n':len(td)}
 
+def refit_baseline(y_col, focus_cx, Xv0, data, model_sel, is_panel, use_rob=False,
+                   id_col=None, tc_col=None):
+    """在数据子集上重新拟合基准模型。返回 {success,coef,se,tstat,pval,n,rsq,error}"""
+    try:
+        n_raw=len(data)
+        if n_raw<30: return {'success':False,'error':'样本量<30','n':n_raw,'coef':np.nan,'se':np.nan,'tstat':np.nan,'pval':np.nan,'rsq':np.nan}
+
+        # ── 面板 FE+RE ──
+        if is_panel and 'FE+RE' in model_sel:
+            if id_col is None or tc_col is None: return {'success':False,'error':'缺少面板ID','n':n_raw}
+            need=[y_col]+[v for v in Xv0 if v in data.columns]+[id_col,tc_col]
+            td=data[need].dropna().copy()
+            td[id_col]=td[id_col].astype(str)
+            if td.duplicated(subset=[id_col,tc_col]).sum()>0:
+                td=td.groupby([id_col,tc_col]).mean().reset_index()
+            td=td.set_index([id_col,tc_col])
+            n=len(td)
+            if n<30: return {'success':False,'error':'样本量<30','n':n}
+            n_id=td.index.get_level_values(0).nunique()
+            if n_id<2: return {'success':False,'error':'个体数<2无法固定效应','n':n}
+            Xv=[v for v in Xv0 if v in td.columns]
+            Xe=sm.add_constant(td[Xv])
+            # FE
+            fe_m=PanelOLS(td[y_col],Xe,entity_effects=True,time_effects=True)
+            try:
+                fe_r=fe_m.fit(cov_type='robust' if use_rob else 'unadjusted')
+            except:
+                fe_r=fe_m.fit()
+            # RE
+            re_m=RandomEffects(td[y_col],Xe)
+            try:
+                re_r=re_m.fit()
+            except:
+                fe=fe_r.params.get(focus_cx,np.nan); fese=fe_r.std_errors.get(focus_cx,np.nan)
+                t=abs(fe/fese) if fese>0 else 0
+                return {'success':True,'coef':float(fe),'se':float(fese),'tstat':float(t),
+                    'pval':float(2*(1-stats.t.cdf(t,df=max(n-len(Xv)-n_id-1,1)))),
+                    'n':n,'rsq':float(fe_r.rsquared)}
+            # Hausman
+            try:
+                common=[c for c in fe_r.params.index.intersection(re_r.params.index) if c!='const']
+                dp=fe_r.params.loc[common]-re_r.params.loc[common]
+                Vv=fe_r.cov.loc[common,common].values-re_r.cov.loc[common,common].values
+                hs=float(dp.values.T@np.linalg.pinv(Vv)@dp.values)
+                hp=float(1-stats.chi2.cdf(hs,df=len(common)))
+                use_fe=hp<0.05
+            except:
+                use_fe=True
+            r=fe_r if use_fe else re_r
+            b=r.params.get(focus_cx,np.nan); se=r.std_errors.get(focus_cx,np.nan)
+            t=abs(b/se) if se>0 else 0
+            df_eff=max(n-len(Xv)-n_id-1,1)
+            return {'success':True,'coef':float(b),'se':float(se),'tstat':float(t),
+                'pval':float(2*(1-stats.t.cdf(t,df=df_eff))),
+                'n':n,'rsq':float(fe_r.rsquared)}
+
+        # ── OLS / Pooled OLS ──
+        if model_sel.startswith('OLS') or 'Pooled' in model_sel:
+            need=[y_col]+[v for v in Xv0 if v in data.columns]
+            td=data[need].dropna()
+            n=len(td)
+            if n<30: return {'success':False,'error':'样本量<30','n':n}
+            Xv=[v for v in Xv0 if v in td.columns]
+            Xd=sm.add_constant(td[Xv])
+            cov_t='HC1' if use_rob else 'nonrobust'
+            m=OLS(td[y_col].values,Xd).fit(cov_type=cov_t)
+            b=m.params.get(focus_cx,np.nan); se=m.bse.get(focus_cx,np.nan)
+            t=abs(b/se) if se>0 else 0
+            return {'success':True,'coef':float(b),'se':float(se),'tstat':float(t),
+                'pval':float(2*(1-stats.t.cdf(t,df=max(n-len(Xv)-1,1)))),
+                'n':n,'rsq':float(m.rsquared)}
+
+        # ── Logit / Probit / LPM ──
+        if 'Logit' in model_sel or 'Probit' in model_sel or 'LPM' in model_sel:
+            need=[y_col]+[v for v in Xv0 if v in data.columns]
+            td=data[need].dropna()
+            n=len(td)
+            if n<30: return {'success':False,'error':'样本量<30','n':n}
+            Xv=[v for v in Xv0 if v in td.columns]
+            Xd=sm.add_constant(td[Xv])
+            y_d=td[y_col]
+            # Prefer Logit, then Probit, then LPM
+            if 'Logit' in model_sel:
+                m=sm.Logit(y_d,Xd).fit(disp=0)
+                b=m.params.get(focus_cx,np.nan); se=m.bse.get(focus_cx,np.nan)
+                t=abs(b/se) if se>0 else 0
+                pv=float(2*(1-stats.norm.cdf(t)))
+                return {'success':True,'coef':float(b),'se':float(se),'tstat':float(t),'pval':pv,'n':n,'rsq':float(m.prsquared)}
+            if 'Probit' in model_sel:
+                m=sm.Probit(y_d,Xd).fit(disp=0)
+                b=m.params.get(focus_cx,np.nan); se=m.bse.get(focus_cx,np.nan)
+                t=abs(b/se) if se>0 else 0
+                pv=float(2*(1-stats.norm.cdf(t)))
+                return {'success':True,'coef':float(b),'se':float(se),'tstat':float(t),'pval':pv,'n':n,'rsq':float(m.prsquared)}
+            # LPM
+            m=OLS(y_d,Xd).fit(cov_type='HC1')
+            b=m.params.get(focus_cx,np.nan); se=m.bse.get(focus_cx,np.nan)
+            t=abs(b/se) if se>0 else 0
+            return {'success':True,'coef':float(b),'se':float(se),'tstat':float(t),
+                'pval':float(2*(1-stats.t.cdf(t,df=max(n-len(Xv)-1,1)))),
+                'n':n,'rsq':float(m.rsquared)}
+
+        # ── Ordered Logit/Probit ──
+        if 'Ordered' in model_sel:
+            need=[y_col]+[v for v in Xv0 if v in data.columns]
+            td=data[need].dropna()
+            n=len(td)
+            if n<30: return {'success':False,'error':'样本量<30','n':n}
+            Xv=[v for v in Xv0 if v in td.columns]
+            Xd=sm.add_constant(td[Xv])
+            distr='probit' if 'Probit' in model_sel else 'logit'
+            m=OrderedModel(td[y_col].astype(int),Xd,distr=distr).fit(disp=0)
+            b=m.params.get(focus_cx,np.nan); se=m.bse.get(focus_cx,np.nan)
+            t=abs(b/se) if se>0 else 0
+            return {'success':True,'coef':float(b),'se':float(se),'tstat':float(t),
+                'pval':float(2*(1-stats.norm.cdf(t))),'n':n,'rsq':float(m.prsquared)}
+
+        # ── Poisson / Negative Binomial ──
+        if 'Poisson' in model_sel or '负二项' in model_sel:
+            need=[y_col]+[v for v in Xv0 if v in data.columns]
+            td=data[need].dropna()
+            n=len(td)
+            if n<30: return {'success':False,'error':'样本量<30','n':n}
+            Xv=[v for v in Xv0 if v in td.columns]
+            Xd=sm.add_constant(td[Xv])
+            fam=Poisson() if 'Poisson' in model_sel else NegativeBinomial()
+            cov_t='HC0' if use_rob else 'nonrobust'
+            m=GLM(td[y_col],Xd,family=fam).fit(cov_type=cov_t)
+            b=m.params.get(focus_cx,np.nan); se=m.bse.get(focus_cx,np.nan)
+            t=abs(b/se) if se>0 else 0
+            rsq=1-m.llf/m.llnull if hasattr(m,'llnull') and m.llnull!=0 else np.nan
+            return {'success':True,'coef':float(b),'se':float(se),'tstat':float(t),
+                'pval':float(2*(1-stats.norm.cdf(t))),'n':n,'rsq':float(rsq)}
+
+        # ── Tobit ──
+        if 'Tobit' in model_sel:
+            need=[y_col]+[v for v in Xv0 if v in data.columns]
+            td=data[need].dropna()
+            n=len(td)
+            if n<30: return {'success':False,'error':'样本量<30','n':n}
+            Xv=[v for v in Xv0 if v in td.columns]
+            Xd=sm.add_constant(td[Xv]).values
+            y_d=td[y_col].values
+            left_val=float(td[y_col].min()) if (td[y_col]==td[y_col].min()).mean()>0.05 else None
+            tr=tobit_mle(y_d,Xd,left=left_val)
+            idx=list(td[Xv].columns); idx=['const']+idx
+            if focus_cx in idx:
+                pi=idx.index(focus_cx)
+                b=float(tr['params'][pi]); se=float(tr['se'][pi])
+                t=abs(b/se) if se>0 else 0
+                return {'success':True,'coef':b,'se':se,'tstat':t,
+                    'pval':float(2*(1-stats.norm.cdf(t))),'n':n,
+                    'rsq':float(1-tr['llf']/(n*np.log(np.std(y_d)))) if tr.get('llf') and not np.isnan(tr['llf']) else np.nan}
+            return {'success':False,'error':f'变量 {focus_cx} 不在模型参数中','n':n}
+
+        # ── 不支持的模型 ──
+        return {'success':False,'error':f'模型 {model_sel} 暂不支持此分析','n':n_raw}
+
+    except Exception as e:
+        return {'success':False,'error':str(e)[:100],'n':0,'coef':np.nan,'se':np.nan,'tstat':np.nan,'pval':np.nan,'rsq':np.nan}
+
 # ═══════════════════ STEP 1: 上传 ═══════════════════
 st.header("Step 1 · 上传数据")
 uploaded = st.file_uploader("拖拽 .dta / .csv / .xlsx", type=['dta','csv','xlsx'])
@@ -866,6 +1027,9 @@ if st.session_state.df is not None:
                 st.session_state._med_m=med_m; st.session_state._mod_m=mod_m
                 st.session_state._add_med=add_med; st.session_state._add_mod=add_mod
                 st.session_state._med_method=med_method
+                # 清理旧的异质性/稳健性结果
+                for sk in [k for k in st.session_state if k.startswith('_het_') or k.startswith('_rob_')]:
+                    del st.session_state[sk]
 
     # ═══════════════════ STEP 4: 结果 ═══════════════════
     if st.session_state.search_results is not None:
@@ -1459,6 +1623,147 @@ if st.session_state.df is not None:
                             with st.expander("Stata 复现代码"): st.code(do,language='stata')
                     else:
                         st.info("未找到有效调节效应结果，请确保基准回归中有显著组合")
+
+                # ═══ 异质性分析 ═══
+                het_skip=['DID','PSM-DID','PSM','IV','ANOVA','交互效应','分组面板','Heckman']
+                if any(sk in model_sel for sk in het_skip):
+                    st.info(f"'{model_sel}' 模型暂不支持异质性分析，请换用 FE+RE/OLS/Logit 等回归模型")
+                else:
+                    with st.expander("异质性分析",expanded=False):
+                        focus_cx=jcx_keys[0] if is_joint else cx
+                        # 分组变量选择
+                        excl_het=[y_col]
+                        if not is_joint: excl_het.append(cx)
+                        else: excl_het.extend(jcx_keys)
+                        if is_panel:
+                            id_col=st.session_state._id_col; tc_col=st.session_state._tc_col
+                            if id_col not in excl_het: excl_het.append(id_col)
+                            if tc_col not in excl_het: excl_het.append(tc_col)
+                        het_candidates=[c for c in df_aug.columns if c not in excl_het]
+                        het_var=st.selectbox("分组变量",het_candidates,key=f'het_gvar_{cx}')
+                        if het_var:
+                            het_series=df_aug[het_var].dropna()
+                            is_cat=het_series.dtype=='object' or het_series.nunique()<=10
+                            het_methods=[]
+                            if is_cat:
+                                st.caption(f"分类变量 · {het_series.nunique()} 个组：{', '.join(str(v) for v in sorted(het_series.unique())[:10])}")
+                                het_methods=['分类']
+                            else:
+                                st.caption("连续变量—选择分组方法（可多选）")
+                                c1,c2=st.columns(2)
+                                with c1:
+                                    if st.checkbox("中位数分组",key=f'het_med_{cx}'): het_methods.append('中位数')
+                                    if st.checkbox("平均数分组",key=f'het_mean_{cx}'): het_methods.append('平均数')
+                                with c2:
+                                    if st.checkbox("三分位数分组",key=f'het_tert_{cx}'): het_methods.append('三分位数')
+                                    if st.checkbox("四分位数分组",key=f'het_quart_{cx}'): het_methods.append('四分位数')
+                            if st.button("运行异质性分析",key=f'run_het_{cx}') and het_methods:
+                                id_col=st.session_state.get('_id_col'); tc_col=st.session_state.get('_tc_col')
+                                needed=[y_col]+Xv0+([] if not is_panel else [id_col,tc_col])
+                                work_data=df_aug[needed+[het_var]].dropna()
+                                groups=[]
+                                if '分类' in het_methods:
+                                    for v in sorted(het_series.dropna().unique()):
+                                        groups.append((f"{het_var}={v}",work_data[work_data[het_var]==v]))
+                                else:
+                                    vals=work_data[het_var]
+                                    if '中位数' in het_methods:
+                                        med=vals.median(); groups.append((f"≥中位数({med:.2f})",work_data[vals>=med])); groups.append((f"<中位数({med:.2f})",work_data[vals<med]))
+                                    if '平均数' in het_methods:
+                                        mn=vals.mean(); groups.append((f"≥均值({mn:.2f})",work_data[vals>=mn])); groups.append((f"<均值({mn:.2f})",work_data[vals<mn]))
+                                    if '三分位数' in het_methods:
+                                        t1,t2=vals.quantile([1/3,2/3])
+                                        groups.append((f"上1/3(>{t2:.2f})",work_data[vals>t2])); groups.append((f"中1/3({t1:.2f}-{t2:.2f})",work_data[(vals>t1)&(vals<=t2)])); groups.append((f"下1/3(<{t1:.2f})",work_data[vals<=t1]))
+                                    if '四分位数' in het_methods:
+                                        q1,q2,q3=vals.quantile([0.25,0.5,0.75])
+                                        groups.append((f"Q4(>{q3:.2f})",work_data[vals>q3])); groups.append((f"Q3({q2:.2f}-{q3:.2f})",work_data[(vals>q2)&(vals<=q3)])); groups.append((f"Q2({q1:.2f}-{q2:.2f})",work_data[(vals>q1)&(vals<=q2)])); groups.append((f"Q1(<{q1:.2f})",work_data[vals<=q1]))
+                                het_results=[]
+                                for grp_label,grp_data in groups:
+                                    ng=len(grp_data)
+                                    if ng<30:
+                                        het_results.append({'分组':grp_label,'N':ng,'系数':'—','SE':'—','t值':'—','p值':'—','R²':'—','备注':'N<30'})
+                                        continue
+                                    fit=refit_baseline(y_col,focus_cx,Xv0,grp_data,model_sel,is_panel,use_rob,id_col,tc_col)
+                                    if fit['success']:
+                                        s='***' if fit['pval']<0.01 else ('**' if fit['pval']<0.05 else ('*' if fit['pval']<0.1 else ''))
+                                        het_results.append({'分组':grp_label,'N':fit['n'],'系数':f"{fit['coef']:.4f}{s}",'SE':f"({fit['se']:.4f})",'t值':f"{fit['tstat']:.2f}",'p值':f"{fit['pval']:.4f}",'R²':f"{fit['rsq']:.3f}" if not np.isnan(fit['rsq']) else 'N/A','备注':''})
+                                    else:
+                                        het_results.append({'分组':grp_label,'N':fit.get('n',0),'系数':'失败','SE':'—','t值':'—','p值':'—','R²':'—','备注':fit.get('error','拟合失败')[:40]})
+                                st.session_state[f'_het_{cx}']={'results':het_results,'group_col':het_var,'focus_cx':focus_cx}
+                        if f'_het_{cx}' in st.session_state:
+                            hst=st.session_state[f'_het_{cx}']
+                            st.caption(f"分组: {hst['group_col']} | 模型: {model_sel} | 变量: {hst['focus_cx']}")
+                            st.dataframe(pd.DataFrame(hst['results']),use_container_width=True,hide_index=True)
+
+                # ═══ 稳健性检验 ═══
+                if any(sk in model_sel for sk in het_skip):
+                    st.info(f"'{model_sel}' 模型暂不支持稳健性检验，请换用 FE+RE/OLS/Logit 等回归模型")
+                else:
+                    with st.expander("稳健性检验",expanded=False):
+                        focus_cx=jcx_keys[0] if is_joint else cx
+                        st.markdown("**缩尾处理 (Winsorization)**")
+                        cwx1,cwx2,cwx3=st.columns(3)
+                        with cwx1:
+                            wx_x1=st.checkbox("核心X 1%缩尾",key=f'wx_x1_{cx}')
+                            wx_y1=st.checkbox("Y 1%缩尾",key=f'wx_y1_{cx}')
+                        with cwx2:
+                            wx_x5=st.checkbox("核心X 5%缩尾",key=f'wx_x5_{cx}')
+                            wx_y5=st.checkbox("Y 5%缩尾",key=f'wx_y5_{cx}')
+                        with cwx3:
+                            wx_x10=st.checkbox("核心X 10%缩尾",key=f'wx_x10_{cx}')
+                            wx_y10=st.checkbox("Y 10%缩尾",key=f'wx_y10_{cx}')
+                        st.markdown("**样本剔除**")
+                        num_cols=[c for c in df_aug.columns if pd.api.types.is_numeric_dtype(df_aug[c]) and c!=y_col]
+                        drop_col=st.selectbox("剔除依据变量",num_cols,key=f'rob_dropcol_{cx}') if num_cols else None
+                        dc1,dc2=st.columns(2)
+                        with dc1: dmin=st.number_input("保留 ≥",value=float(df_aug[drop_col].min()) if drop_col else 0.0,key=f'rob_dmin_{cx}')
+                        with dc2: dmax=st.number_input("保留 ≤",value=float(df_aug[drop_col].max()) if drop_col else 100.0,key=f'rob_dmax_{cx}')
+                        use_drop=st.checkbox("启用样本剔除",key=f'rob_drop_en_{cx}') if drop_col else False
+                        st.info("更换X/Y变量、增删控制变量等请返回 Step 3 重新搜索基准回归")
+                        if st.button("运行稳健性检验",key=f'run_rob_{cx}'):
+                            id_col=st.session_state.get('_id_col'); tc_col=st.session_state.get('_tc_col')
+                            needed=[y_col]+Xv0+([] if not is_panel else [id_col,tc_col])
+                            base_data=df_aug[needed].dropna()
+                            baseline=refit_baseline(y_col,focus_cx,Xv0,base_data,model_sel,is_panel,use_rob,id_col,tc_col)
+                            rob_results=[]
+                            if baseline['success']:
+                                s='***' if baseline['pval']<0.01 else ('**' if baseline['pval']<0.05 else ('*' if baseline['pval']<0.1 else ''))
+                                rob_results.append({'检验方式':'基准回归','N':baseline['n'],'系数':f"{baseline['coef']:.4f}{s}",'SE':f"({baseline['se']:.4f})",'t值':f"{baseline['tstat']:.2f}",'R²':f"{baseline['rsq']:.3f}" if not np.isnan(baseline['rsq']) else 'N/A'})
+                            else:
+                                rob_results.append({'检验方式':'基准回归','N':baseline.get('n',0),'系数':'失败','SE':baseline.get('error','')[:30],'t值':'—','R²':'—'})
+                            # Winsorization runs
+                            wx_runs=[(wx_x1,'X 1%缩尾','X',1),(wx_x5,'X 5%缩尾','X',5),(wx_x10,'X 10%缩尾','X',10),
+                                     (wx_y1,'Y 1%缩尾','Y',1),(wx_y5,'Y 5%缩尾','Y',5),(wx_y10,'Y 10%缩尾','Y',10)]
+                            for enabled,label,target,pct in wx_runs:
+                                if not enabled: continue
+                                wdata=base_data.copy()
+                                if target=='Y':
+                                    lo,hi=wdata[y_col].quantile(pct/100),wdata[y_col].quantile(1-pct/100)
+                                    wdata[y_col]=wdata[y_col].clip(lo,hi)
+                                else:
+                                    for xv in [v for v in Xv0 if v in wdata.columns]:
+                                        lo,hi=wdata[xv].quantile(pct/100),wdata[xv].quantile(1-pct/100)
+                                        wdata[xv]=wdata[xv].clip(lo,hi)
+                                wdata=wdata.dropna()
+                                fit=refit_baseline(y_col,focus_cx,Xv0,wdata,model_sel,is_panel,use_rob,id_col,tc_col)
+                                if fit['success']:
+                                    s='***' if fit['pval']<0.01 else ('**' if fit['pval']<0.05 else ('*' if fit['pval']<0.1 else ''))
+                                    rob_results.append({'检验方式':label,'N':fit['n'],'系数':f"{fit['coef']:.4f}{s}",'SE':f"({fit['se']:.4f})",'t值':f"{fit['tstat']:.2f}",'R²':f"{fit['rsq']:.3f}" if not np.isnan(fit['rsq']) else 'N/A'})
+                                else:
+                                    rob_results.append({'检验方式':label,'N':fit.get('n',0),'系数':'失败','SE':fit.get('error','')[:30],'t值':'—','R²':'—'})
+                            # Sample dropping
+                            if use_drop and drop_col:
+                                ddata=base_data[(base_data[drop_col]>=dmin)&(base_data[drop_col]<=dmax)]
+                                fit=refit_baseline(y_col,focus_cx,Xv0,ddata,model_sel,is_panel,use_rob,id_col,tc_col)
+                                if fit['success']:
+                                    s='***' if fit['pval']<0.01 else ('**' if fit['pval']<0.05 else ('*' if fit['pval']<0.1 else ''))
+                                    rob_results.append({'检验方式':f'保留 {drop_col}∈[{dmin},{dmax}]','N':fit['n'],'系数':f"{fit['coef']:.4f}{s}",'SE':f"({fit['se']:.4f})",'t值':f"{fit['tstat']:.2f}",'R²':f"{fit['rsq']:.3f}" if not np.isnan(fit['rsq']) else 'N/A'})
+                                else:
+                                    rob_results.append({'检验方式':f'保留 {drop_col}∈[{dmin},{dmax}]','N':fit.get('n',0),'系数':'失败','SE':fit.get('error','')[:30],'t值':'—','R²':'—'})
+                            st.session_state[f'_rob_{cx}']=rob_results
+                        if f'_rob_{cx}' in st.session_state:
+                            st.caption(f"模型: {model_sel} | 变量: {focus_cx}")
+                            st.dataframe(pd.DataFrame(st.session_state[f'_rob_{cx}']),use_container_width=True,hide_index=True)
 
 st.markdown("---")
 st.caption("鹈鹕回归 · 仅供学术研究参考 · 数据仅存于你的电脑 · 使用即表示同意自行验证所有结果")
