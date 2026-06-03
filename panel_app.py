@@ -381,8 +381,8 @@ if st.session_state.df is not None:
 
         # ── 面板/横截面：通用变量选择 ──
         if dt=='panel':
-            idc,tc=st.session_state.id_col,st.session_state.time_col
-            excl=[idc,tc]
+            id_col,tc=st.session_state.id_col,st.session_state.time_col
+            excl=[id_col,tc]
         else:
             excl=[]
         # 数值列
