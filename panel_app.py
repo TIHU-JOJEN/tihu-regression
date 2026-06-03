@@ -349,10 +349,31 @@ if st.session_state.df is not None:
             help="分别：为每个核心X找各自的最优控制组合｜同时：控制组合必须让所有核心X都显著")
 
         # 模型特有选项
-        use_cl=False; bin_m=None; did_var=None; heckman_sel=None
+        use_cl=False; cluster_col=None; use_rob=False; se_mode='ordinary'
+        bin_m=None; did_var=None; heckman_sel=None
         iv_endog=None; iv_insts=[]
         if dt=='panel':
-            if 'FE+RE' in sel_model: use_cl=st.checkbox("聚类标准误（到个体 ID）",value=True,key='cl7')
+            if 'FE+RE' in sel_model:
+                n_u=st.session_state.n_units
+                if n_u>=30:   rec_se,rec_msg='cluster',f"推荐：聚类到 {id_col}（{n_u} 个体，组内相关需聚类SE）"
+                elif n_u>=10: rec_se,rec_msg='robust',f"推荐：稳健SE（仅 {n_u} 个体，聚类不可靠，改用异方差稳健）"
+                else:         rec_se,rec_msg='ordinary',f"推荐：普通SE（仅 {n_u} 个体）"
+                se_choice=st.radio("标准误（SE）",
+                    ["💡 智能推荐","聚类 SE","稳健 SE (HC1)","普通 SE"],
+                    horizontal=True,key='semode7')
+                if '智能' in se_choice:
+                    st.info(rec_msg)
+                    se_mode=rec_se
+                elif '聚类' in se_choice: se_mode='cluster'
+                elif '稳健' in se_choice: se_mode='robust'
+                else:                      se_mode='ordinary'
+                use_cl=(se_mode=='cluster')
+                use_rob=(se_mode in ('robust','cluster'))
+                if use_cl:
+                    cluster_opts=[id_col]+[c for c in cols if c not in [id_col,tc] and (c in cat_cols or (pd.api.types.is_numeric_dtype(df[c]) and 2<=df[c].nunique()<=30))]
+                    cluster_col=st.selectbox("聚类变量",cluster_opts,index=0,key='cl7')
+                else:
+                    cluster_col=None
             if 'DID' in sel_model and 'PSM' not in sel_model:
                 did_var=st.selectbox("处理变量（二分，1=处理组）",bin_vars,key='did7')
                 st.caption("模型将自动创建 Post×Treat 交互项")
@@ -474,18 +495,44 @@ if st.session_state.df is not None:
                             Xex=sm.add_constant(td[Xv])
                             fe_m=PanelOLS(td[y_col],Xex,entity_effects=True,time_effects=True)
                             re_m=RandomEffects(td[y_col],Xex)
-                            cok=False
+                            cok=False; tstat_ord=0.0; tstat_rob=0.0; ts_cl=0.0
+                            fell_back=False; se_used='ordinary'
+                            # 1. 普通 SE（基线）
                             try:
-                                if use_cl:
-                                    ca=td.index.get_level_values(0).to_numpy()
-                                    fe_r=fe_m.fit(cov_type='clustered',clusters=ca)
-                                    re_r=re_m.fit(cov_type='clustered',clusters=ca); cok=True
-                                else: fe_r=fe_m.fit(); re_r=re_m.fit()
-                            except:
-                                try: fe_r=fe_m.fit(); re_r=re_m.fit()
-                                except: continue
-                            fe_b=fe_r.params.get(cx,np.nan); fe_se=fe_r.std_errors.get(cx,np.nan)
-                            ts=fe_b/fe_se if fe_se>0 else 0
+                                fe_ord=fe_m.fit(); re_ord=re_m.fit()
+                                b_ord=fe_ord.params.get(cx,np.nan); s_ord=fe_ord.std_errors.get(cx,np.nan)
+                                tstat_ord=float(b_ord/s_ord) if s_ord>0 else 0
+                            except: continue
+                            fe_r,re_r=fe_ord,re_ord; fe_b,fe_se,ts=b_ord,s_ord,tstat_ord
+                            # 2. 稳健 SE（use_rob 对 robust 和 cluster 模式都为 True）
+                            if use_rob:
+                                try:
+                                    fe_rob=fe_m.fit(cov_type='robust'); re_rob=re_m.fit(cov_type='robust')
+                                    b_rob=fe_rob.params.get(cx,np.nan); s_rob=fe_rob.std_errors.get(cx,np.nan)
+                                    tstat_rob=float(b_rob/s_rob) if s_rob>0 else 0
+                                except: pass
+                            # 3. 聚类 SE
+                            if use_cl and cluster_col:
+                                try:
+                                    cl_vals=df_aug.set_index([id_col,tc_col]).loc[td.index,cluster_col].values
+                                    fe_cl=fe_m.fit(cov_type='clustered',clusters=cl_vals)
+                                    re_cl=re_m.fit(cov_type='clustered',clusters=cl_vals); cok=True
+                                    b_cl=fe_cl.params.get(cx,np.nan); s_cl=fe_cl.std_errors.get(cx,np.nan)
+                                    ts_cl=float(b_cl/s_cl) if s_cl>0 else 0
+                                except: pass
+                            # 4. 回退链：cluster → robust → ordinary
+                            if cok and abs(ts_cl)>=1.96:
+                                fe_r,re_r=fe_cl,re_cl; fe_b,fe_se,ts=b_cl,s_cl,ts_cl; se_used='cluster'
+                            elif use_rob and abs(tstat_rob)>=1.96:
+                                fe_r,re_r=fe_rob,re_rob; fe_b,fe_se,ts=b_rob,s_rob,tstat_rob; se_used='robust'
+                                if cok: fell_back=True
+                            elif abs(tstat_ord)>=1.96:
+                                se_used='ordinary'
+                                if use_rob: fell_back=True
+                            else:
+                                # 都不显著→用首选（最高级）SE
+                                if cok: se_used='cluster'; fe_r,re_r=fe_cl,re_cl; fe_b,fe_se,ts=b_cl,s_cl,ts_cl
+                                elif use_rob: se_used='robust'; fe_r,re_r=fe_rob,re_rob; fe_b,fe_se,ts=b_rob,s_rob,tstat_rob
                             re_b=re_r.params.get(cx,np.nan); re_se=re_r.std_errors.get(cx,np.nan)
                             common=[c for c in fe_r.params.index.intersection(re_r.params.index) if c!='const']
                             hs,hp=np.nan,np.nan
@@ -500,6 +547,9 @@ if st.session_state.df is not None:
                             res.append(dict(controls=combo,n=len(td),n_units=n_id_i,n_periods=n_t_i,
                                 fe_beta=float(fe_b),fe_se=float(fe_se),re_beta=float(re_b),re_se=float(re_se),
                                 tstat=float(ts),pval=float(2*(1-stats.t.cdf(abs(ts),df=len(td)-len(Xv)-1))),
+                                se_used=se_used,fell_back=fell_back,
+                                tstat_ord=float(tstat_ord),tstat_rob=float(tstat_rob) if use_rob else None,
+                                tstat_clust=float(ts_cl) if cok else None,
                                 fe_rsq=float(fe_r.rsquared),re_rsq=float(re_r.rsquared),
                                 hausman_chi2=float(hs) if not np.isnan(hs) else None,
                                 hausman_p=float(hp) if not np.isnan(hp) else None,
@@ -534,21 +584,45 @@ if st.session_state.df is not None:
                             Xex=sm.add_constant(td[Xv])
                             fe_m=PanelOLS(td[y_col],Xex,entity_effects=True,time_effects=True)
                             re_m=RandomEffects(td[y_col],Xex)
-                            cok=False
+                            cok=False; fell_back_j=False; se_used_j='ordinary'
+                            def _tstats_dict(fit,cxlist):
+                                d={}
+                                for cxx in cxlist:
+                                    b=fit.params.get(cxx,np.nan); s=fit.std_errors.get(cxx,np.nan)
+                                    d[cxx]=float(b/s) if s>0 else 0
+                                return d,min(abs(t) for t in d.values())
+                            # 1. 普通
                             try:
-                                if use_cl:
-                                    ca=td.index.get_level_values(0).to_numpy()
-                                    fe_r=fe_m.fit(cov_type='clustered',clusters=ca)
-                                    re_r=re_m.fit(cov_type='clustered',clusters=ca); cok=True
-                                else: fe_r=fe_m.fit(); re_r=re_m.fit()
-                            except:
-                                try: fe_r=fe_m.fit(); re_r=re_m.fit()
-                                except: continue
-                            tstats={}
-                            for cxx in cx_list:
-                                b=fe_r.params.get(cxx,np.nan); s=fe_r.std_errors.get(cxx,np.nan)
-                                tstats[cxx]=float(b/s) if s>0 else 0
-                            min_t=min(abs(t) for t in tstats.values())
+                                fe_ord=fe_m.fit(); re_ord=re_m.fit()
+                                tstats_ord,min_t_ord=_tstats_dict(fe_ord,cx_list)
+                            except: continue
+                            fe_r,re_r=fe_ord,re_ord; tstats=tstats_ord; min_t=min_t_ord
+                            # 2. 稳健
+                            if use_rob:
+                                try:
+                                    fe_rob=fe_m.fit(cov_type='robust'); re_rob=re_m.fit(cov_type='robust')
+                                    tstats_rob,min_t_rob=_tstats_dict(fe_rob,cx_list)
+                                except: pass
+                            # 3. 聚类
+                            if use_cl and cluster_col:
+                                try:
+                                    cl_vals=df_aug.set_index([id_col,tc_col]).loc[td.index,cluster_col].values
+                                    fe_cl=fe_m.fit(cov_type='clustered',clusters=cl_vals)
+                                    re_cl=re_m.fit(cov_type='clustered',clusters=cl_vals); cok=True
+                                    tstats_cl,min_t_cl=_tstats_dict(fe_cl,cx_list)
+                                except: pass
+                            # 4. 回退链
+                            if cok and min_t_cl>=1.96:
+                                fe_r,re_r=fe_cl,re_cl; tstats=tstats_cl; min_t=min_t_cl; se_used_j='cluster'
+                            elif use_rob and min_t_rob>=1.96:
+                                fe_r,re_r=fe_rob,re_rob; tstats=tstats_rob; min_t=min_t_rob; se_used_j='robust'
+                                if cok: fell_back_j=True
+                            elif min_t_ord>=1.96:
+                                se_used_j='ordinary'
+                                if use_rob: fell_back_j=True
+                            else:
+                                if cok: se_used_j='cluster'; fe_r,re_r=fe_cl,re_cl; tstats=tstats_cl; min_t=min_t_cl
+                                elif use_rob: se_used_j='robust'; fe_r,re_r=fe_rob,re_rob; tstats=tstats_rob; min_t=min_t_rob
                             fc0=cx_list[0]
                             fe_b=fe_r.params.get(fc0,np.nan); fe_s=fe_r.std_errors.get(fc0,np.nan)
                             re_b=re_r.params.get(fc0,np.nan); re_s=re_r.std_errors.get(fc0,np.nan)
@@ -567,6 +641,7 @@ if st.session_state.df is not None:
                                 n_periods=td.index.get_level_values(1).nunique(),
                                 fe_beta=float(fe_b),fe_se=float(fe_s),re_beta=float(re_b),re_se=float(re_s),
                                 tstat=float(ts),tstats=tstats,min_abs_tstat=float(min_t),
+                                se_used=se_used_j,fell_back=fell_back_j,
                                 fe_rsq=float(fe_r.rsquared),re_rsq=float(re_r.rsquared),
                                 hausman_chi2=float(hs) if not np.isnan(hs) else None,
                                 hausman_p=float(hp) if not np.isnan(hp) else None,
@@ -607,6 +682,8 @@ if st.session_state.df is not None:
                 for kk in ['_did_var','_use_cl','_heckman_sel','_iv_endog','_iv_insts','_id_col','_tc_col','_bin_m']:
                     if kk in st.session_state: del st.session_state[kk]
                 st.session_state._did_var=did_var; st.session_state._use_cl=use_cl
+                st.session_state._cluster_col=cluster_col
+                st.session_state._se_mode=se_mode; st.session_state._use_rob=use_rob
                 st.session_state._heckman_sel=heckman_sel
                 st.session_state._iv_endog=iv_endog; st.session_state._iv_insts=iv_insts
                 st.session_state._id_col=st.session_state.id_col if dt=='panel' else None
@@ -622,6 +699,8 @@ if st.session_state.df is not None:
         model_sel=st.session_state._model; yt=st.session_state._y_type
         is_panel=st.session_state._is_panel; sub=st.session_state._sub
         did_var=st.session_state._did_var; use_cl=st.session_state._use_cl
+        cluster_col=st.session_state.get('_cluster_col',None)
+        se_mode=st.session_state.get('_se_mode','ordinary'); use_rob=st.session_state.get('_use_rob',False)
         heckman_sel=st.session_state._heckman_sel
         iv_endog=st.session_state._iv_endog; iv_insts=st.session_state._iv_insts
         group_var=st.session_state.get('_group_var',None)
@@ -702,15 +781,29 @@ if st.session_state.df is not None:
                         rows.append({'变量':'常数项','FE 系数':f"{const_fb:.4f}",'FE (SE)':f"({chosen.get('const_fe_se',np.nan):.4f})",
                             'RE 系数':f"{chosen.get('const_re_b',np.nan):.4f}",'RE (SE)':f"({chosen.get('const_re_se',np.nan):.4f})"})
                     st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
-                    se_n="聚类稳健" if chosen.get('cluster_ok') else "普通稳健"
-                    st.caption(f"注：{se_n}SE。*** p<0.01, ** p<0.05, * p<0.10。\nN={N_eff}｜个体={n_id}｜时期={n_t}\n含个体+时间固定效应\nFE R²={chosen['fe_rsq']:.4f}｜RE R²={chosen['re_rsq']:.4f}")
-                    do=(f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* {model_line}\n\nuse \"data.dta\", clear\nxtset {id_col} {tc_col}\n\n")
-                    if use_cl and not chosen.get('cluster_ok'):
-                        st.warning("Python 聚类SE估计失败（已降级为普通SE），但 Stata 代码保留了 vce(cluster) 设定，请在 Stata 中验证")
-                    if use_cl: do+=f"reghdfe {y_col} {cx} {' '.join(ctrls)}, absorb({id_col} {tc_col}) vce(cluster {id_col})\n"
+                    fell_back=chosen.get('fell_back',False); cok=chosen.get('cluster_ok',False)
+                    se_used_r=chosen.get('se_used','ordinary')
+                    # 回退警告
+                    if fell_back:
+                        if se_used_r=='robust':
+                            ts_hi=chosen.get('tstat_clust') or 0; ts_lo=chosen.get('tstat_rob') or 0
+                            st.warning(f"聚类到 {cluster_col} 后不显著（|t|={ts_hi:.2f}），已回退至稳健 SE（|t|={ts_lo:.2f}）")
+                        elif se_used_r=='ordinary':
+                            ts_hi=chosen.get('tstat_rob') or chosen.get('tstat_clust') or 0; ts_lo=chosen.get('tstat_ord') or 0
+                            st.warning(f"聚类/稳健 SE 下不显著（|t|={ts_hi:.2f}），已回退至普通 SE（|t|={ts_lo:.2f}）")
+                    # SE 标签
+                    if se_used_r=='cluster': se_label="聚类稳健SE" if not fell_back else "聚类稳健SE"
+                    elif se_used_r=='robust': se_label="异方差稳健SE (HC1)"
+                    else: se_label="普通SE"
+                    st.caption(f"注：{se_label}。*** p<0.01, ** p<0.05, * p<0.10。\nN={N_eff}｜个体={n_id}｜时期={n_t}\n含个体+时间固定效应\nFE R²={chosen['fe_rsq']:.4f}｜RE R²={chosen['re_rsq']:.4f}")
+                    # Stata 代码
+                    do=(f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* {model_line} ｜ SE: {se_label}\n\nuse \"data.dta\", clear\nxtset {id_col} {tc_col}\n\n")
+                    if se_used_r=='cluster': do+=f"reghdfe {y_col} {cx} {' '.join(ctrls)}, absorb({id_col} {tc_col}) vce(cluster {cluster_col})\n"
+                    elif se_used_r=='robust': do+=f"reghdfe {y_col} {cx} {' '.join(ctrls)}, absorb({id_col} {tc_col}) vce(robust)\n"
                     else: do+=f"reghdfe {y_col} {cx} {' '.join(ctrls)}, absorb({id_col} {tc_col})\n"
                     do+="est sto fe\n\n"
-                    if use_cl: do+=f"xtreg {y_col} {cx} {' '.join(ctrls)}, re vce(cluster {id_col})\n"
+                    if se_used_r=='cluster': do+=f"xtreg {y_col} {cx} {' '.join(ctrls)}, re vce(cluster {cluster_col})\n"
+                    elif se_used_r=='robust': do+=f"xtreg {y_col} {cx} {' '.join(ctrls)}, re vce(robust)\n"
                     else: do+=f"xtreg {y_col} {cx} {' '.join(ctrls)}, re\n"
                     do+="est sto re\nhausman fe re\n"
                     with st.expander("Stata 复现代码"): st.code(do,language='stata')
