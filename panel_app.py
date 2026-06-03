@@ -301,7 +301,7 @@ if st.session_state.df is not None:
         model_options=[]
         if dt=='panel':
             if y_type=='binary': model_options=['Logit','Probit','Logit+Probit']
-            else: model_options=['FE+RE（固定+随机效应）']
+            else: model_options=['FE+RE（固定+随机效应）','Pooled OLS（忽略面板结构）']
             rem_p=[c for c in all_vars if c!=y_col]
             all_bin=[c for c in rem_p if len(df_aug[c].dropna().unique())==2]
             bin_vars=[c for c in all_bin if c in all_num]  # 原始数值二分变量
@@ -343,6 +343,10 @@ if st.session_state.df is not None:
         with c3: cmin=st.number_input("最少控制数",0,15,2,key='cmin7')
         with c4: cmax=st.number_input("最多控制数",1,15,min(5,len(ctrl_pool) if ctrl_pool else 5),key='cmax7')
         if cmax<cmin: cmax=cmin
+
+        search_mode=st.radio("核心X显著要求",['分别显著（各X独立搜索）','同时显著（所有X联合搜索）'],
+            horizontal=True,key='smode7',
+            help="分别：为每个核心X找各自的最优控制组合｜同时：控制组合必须让所有核心X都显著")
 
         # 模型特有选项
         use_cl=False; bin_m=None; did_var=None; heckman_sel=None
@@ -415,12 +419,48 @@ if st.session_state.df is not None:
                     res.sort(key=lambda x: abs(x['tstat']),reverse=True)
                     return res
 
-                # ── 面板搜索（完整 FE+RE+Hausman） ──
-                def search_panel_full(cx,pool,mn,mx):
+                def search_ols_joint(core_xs,pool,mn,mx):
+                    """OLS搜索：所有核心X联合，按 min|t| 排序"""
                     res=[]; ac=[]
                     for k in range(mn,mx+1): ac.extend(combinations(pool,k))
                     n_total=len(ac)
                     if n_total>10000:
+                        rng=np.random.RandomState(42)
+                        ac=[ac[i] for i in rng.choice(n_total,10000,replace=False)]
+                        n_total=10000
+                    cx_list=list(core_xs)
+                    for i,combo in enumerate(ac):
+                        if i%1000==0: progress.progress(min(i/n_total,.95),text=f"联合搜索: {i}/{n_total}")
+                        try:
+                            Xv=cx_list+list(combo); td=sub[[y_col]+Xv].dropna()
+                            if len(td)<30: continue
+                            m=OLS(td[y_col].values,sm.add_constant(td[Xv].values)).fit()
+                            ols_p={}; tstats={}; pidx=list(m.params.index)
+                            for jj in range(min(len(pidx),len(['const']+Xv))):
+                                ols_p[pidx[jj]]={'b':float(m.params.iloc[jj]),'se':float(m.bse.iloc[jj])}
+                            for cx in cx_list:
+                                try:
+                                    idx=list(m.params.index).index(cx)
+                                    b=m.params.iloc[idx]; se=m.bse.iloc[idx]
+                                    tstats[cx]=float(b/se) if se>0 else 0
+                                except: tstats[cx]=0
+                            min_t=min(abs(t) for t in tstats.values())
+                            res.append(dict(controls=combo,n=len(td),min_abs_tstat=float(min_t),
+                                tstats=tstats,rsq=float(m.rsquared),rsq_adj=float(m.rsquared_adj),
+                                ols_params=ols_p,all_Xv=Xv))
+                        except: continue
+                    res.sort(key=lambda x: x['min_abs_tstat'],reverse=True)
+                    return res
+
+                # ── 面板搜索（完整 FE+RE+Hausman） ──
+                def search_panel_full(cx,pool,mn,mx,preselected_ctrls=None):
+                    res=[]; ac=[]
+                    if preselected_ctrls is not None:
+                        ac=preselected_ctrls  # 只评估预选的组合（两阶段加速）
+                    else:
+                        for k in range(mn,mx+1): ac.extend(combinations(pool,k))
+                    n_total=len(ac)
+                    if n_total>10000 and preselected_ctrls is None:
                         rng=np.random.RandomState(42)
                         ac=[ac[i] for i in rng.choice(n_total,10000,replace=False)]
                         n_total=10000
@@ -473,20 +513,107 @@ if st.session_state.df is not None:
                     res.sort(key=lambda x: abs(x['tstat']),reverse=True)
                     return res
 
-                sr={}
-                for cx in core_x:
-                    stxt.text(f"搜索 {cx}...")
-                    if dt=='panel' and 'FE+RE' in sel_model:
-                        sr[cx]=search_panel_full(cx,ctrl_pool,amn,amx)[:50]
+                def search_panel_joint(core_xs,pool,mn,mx,preselected_ctrls=None):
+                    """面板联合搜索：所有核心X一起进入 FE+RE，按 min|t| 排序"""
+                    res=[]; ac=[]; cx_list=list(core_xs)
+                    if preselected_ctrls is not None:
+                        ac=preselected_ctrls
                     else:
-                        sr[cx]=search_ols(cx,ctrl_pool,amn,amx)[:50]
-                    stxt.text(f"{cx}: {len(sr[cx])} 个有效组合")
+                        for k in range(mn,mx+1): ac.extend(combinations(pool,k))
+                    n_total=len(ac)
+                    if n_total>10000 and preselected_ctrls is None:
+                        rng=np.random.RandomState(42)
+                        ac=[ac[i] for i in rng.choice(n_total,10000,replace=False)]
+                        n_total=10000
+                    d=sub.set_index([id_col,tc_col])[[y_col]+cx_list+pool].dropna()
+                    for i,combo in enumerate(ac):
+                        if i%500==0: progress.progress(min(i/n_total,.95),text=f"面板联合: {i}/{n_total}")
+                        try:
+                            Xv=cx_list+list(combo); td=d[[y_col]+Xv].dropna()
+                            if len(td)<50: continue
+                            Xex=sm.add_constant(td[Xv])
+                            fe_m=PanelOLS(td[y_col],Xex,entity_effects=True,time_effects=True)
+                            re_m=RandomEffects(td[y_col],Xex)
+                            cok=False
+                            try:
+                                if use_cl:
+                                    ca=td.index.get_level_values(0).to_numpy()
+                                    fe_r=fe_m.fit(cov_type='clustered',clusters=ca)
+                                    re_r=re_m.fit(cov_type='clustered',clusters=ca); cok=True
+                                else: fe_r=fe_m.fit(); re_r=re_m.fit()
+                            except:
+                                try: fe_r=fe_m.fit(); re_r=re_m.fit()
+                                except: continue
+                            tstats={}
+                            for cxx in cx_list:
+                                b=fe_r.params.get(cxx,np.nan); s=fe_r.std_errors.get(cxx,np.nan)
+                                tstats[cxx]=float(b/s) if s>0 else 0
+                            min_t=min(abs(t) for t in tstats.values())
+                            fc0=cx_list[0]
+                            fe_b=fe_r.params.get(fc0,np.nan); fe_s=fe_r.std_errors.get(fc0,np.nan)
+                            re_b=re_r.params.get(fc0,np.nan); re_s=re_r.std_errors.get(fc0,np.nan)
+                            ts=fe_b/fe_s if fe_s>0 else 0
+                            common=[c for c in fe_r.params.index.intersection(re_r.params.index) if c!='const']
+                            hs,hp=np.nan,np.nan
+                            if common:
+                                d_p=fe_r.params.loc[common]-re_r.params.loc[common]
+                                Vv=fe_r.cov.loc[common,common].values-re_r.cov.loc[common,common].values
+                                try: hs=float(d_p.values.T@np.linalg.pinv(Vv)@d_p.values); hp=float(1-stats.chi2.cdf(hs,df=len(common)))
+                                except: pass
+                            all_v=[v for v in fe_r.params.index if v!='const']
+                            fe_params={v:{'b':float(fe_r.params[v]),'se':float(fe_r.std_errors[v])} for v in all_v}
+                            re_params={v:{'b':float(re_r.params[v]),'se':float(re_r.std_errors[v])} for v in all_v if v in re_r.params.index}
+                            res.append(dict(controls=combo,n=len(td),n_units=td.index.get_level_values(0).nunique(),
+                                n_periods=td.index.get_level_values(1).nunique(),
+                                fe_beta=float(fe_b),fe_se=float(fe_s),re_beta=float(re_b),re_se=float(re_s),
+                                tstat=float(ts),tstats=tstats,min_abs_tstat=float(min_t),
+                                fe_rsq=float(fe_r.rsquared),re_rsq=float(re_r.rsquared),
+                                hausman_chi2=float(hs) if not np.isnan(hs) else None,
+                                hausman_p=float(hp) if not np.isnan(hp) else None,
+                                hausman_df=len(common) if common else 0,cluster_ok=cok,
+                                fe_params=fe_params,re_params=re_params,
+                                const_fe_b=float(fe_r.params.get('const',np.nan)),
+                                const_fe_se=float(fe_r.std_errors.get('const',np.nan)),
+                                const_re_b=float(re_r.params.get('const',np.nan)),
+                                const_re_se=float(re_r.std_errors.get('const',np.nan)),Xv=Xv))
+                        except: continue
+                    res.sort(key=lambda x: x['min_abs_tstat'],reverse=True)
+                    return res
+
+                sr={}
+                if '同时' in search_mode and len(core_x)>1:
+                    # 联合显著：所有核心X一起搜索，按最弱|t|排序
+                    stxt.text("联合搜索（所有核心X同时显著）...")
+                    if dt=='panel' and 'FE+RE' in sel_model:
+                        ols_res=search_ols_joint(core_x,ctrl_pool,amn,amx)
+                        top20=[r['controls'] for r in ols_res[:20]]
+                        sr['joint']=search_panel_joint(core_x,ctrl_pool,amn,amx,preselected_ctrls=top20)
+                        for r in sr['joint']:
+                            for o_r in ols_res:
+                                if set(r['controls'])==set(o_r['controls']):
+                                    r['tstats']=o_r.get('tstats',{}); r['ols_params']=o_r.get('ols_params',{})
+                                    break
+                    else:
+                        sr['joint']=search_ols_joint(core_x,ctrl_pool,amn,amx)[:50]
+                    stxt.text(f"联合搜索: {len(sr['joint'])} 个有效组合")
+                else:
+                    # 分别显著：每个核心X独立搜索
+                    for cx in core_x:
+                        stxt.text(f"搜索 {cx}...")
+                        if dt=='panel' and 'FE+RE' in sel_model:
+                            # 两阶段加速：OLS 初筛 → FE+RE 跑 top20
+                            ols_res=search_ols(cx,ctrl_pool,amn,amx)
+                            top20_ctrls=[r['controls'] for r in ols_res[:20]]
+                            sr[cx]=search_panel_full(cx,ctrl_pool,amn,amx,preselected_ctrls=top20_ctrls)
+                        else:
+                            sr[cx]=search_ols(cx,ctrl_pool,amn,amx)[:50]
+                        stxt.text(f"{cx}: {len(sr[cx])} 个有效组合")
                 progress.progress(1.0)
                 st.success(f"完成！{time.time()-t0:.1f}s")
                 st.session_state.search_results=sr
                 st.session_state._y=y_col; st.session_state._y_type=y_type
                 st.session_state._is_panel=(dt=='panel'); st.session_state._model=sel_model
-                st.session_state._sub=sub
+                st.session_state._sub=sub; st.session_state._search_mode=search_mode
                 for kk in ['_did_var','_use_cl','_heckman_sel','_iv_endog','_iv_insts','_id_col','_tc_col','_bin_m']:
                     if kk in st.session_state: del st.session_state[kk]
                 st.session_state._did_var=did_var; st.session_state._use_cl=use_cl
@@ -509,24 +636,39 @@ if st.session_state.df is not None:
         iv_endog=st.session_state._iv_endog; iv_insts=st.session_state._iv_insts
         group_var=st.session_state.get('_group_var',None)
         df_aug=st.session_state.get('_df_aug',sub)
+        search_mode=st.session_state.get('_search_mode','分别显著（各X独立搜索）')
+        is_joint=('同时' in search_mode)
 
         for cx,results in sr.items():
             if not results: st.warning(f"{cx}: 无有效组合"); continue
-            top=results[:20]; sig05=sum(1 for r in results if r['pval']<0.05)
+            top=results[:20]
+            # 获取核心X列表
+            if is_joint and results:
+                jcx_keys=[k for k in results[0].get('tstats',{}).keys()]
+            else:
+                jcx_keys=[]
 
             # 排名表
             tbl=[]
             for i,r in enumerate(top):
                 cs=', '.join(r['controls'][:4])
                 if len(r['controls'])>4: cs+=f' +{len(r["controls"])-4}'
-                s='***' if r['pval']<0.01 else ('**' if r['pval']<0.05 else ('*' if r['pval']<0.1 else ''))
                 cx_b='—'
-                if 'fe_beta' in r: cx_b=f"{r['fe_beta']:.4f}{s}"
-                elif 'ols_params' in r and len(r['ols_params'])>1:
-                    pk=list(r['ols_params'].keys())[1]; cx_b=f"{r['ols_params'][pk]['b']:.4f}{s}"
-                tbl.append({'#':i+1,'控制组合':cs,'β(SE)':cx_b,'|t|':f"{abs(r['tstat']):.2f}",
-                    'R²':f"{r.get('fe_rsq',r.get('rsq',0)):.3f}",'N':r['n']})
-            expander_label=f"**{cx}** — {len(results)}组合 ｜ p<0.05占 {sig05/max(len(results),1)*100:.0f}%"
+                if is_joint:
+                    # 联合模式：显示 min|t| + 各核心X的t
+                    t_parts=[f"{k}={abs(r.get('tstats',{}).get(k,0)):.1f}" for k in jcx_keys[:4]]
+                    cx_b=f"min|t|={r.get('min_abs_tstat',0):.2f} [{', '.join(t_parts)}]"
+                    tbl.append({'#':i+1,'控制组合':cs,'联合t (min|t|及各X)':cx_b,
+                        'R²':f"{r.get('rsq',0):.3f}",'N':r['n']})
+                else:
+                    s='***' if r['pval']<0.01 else ('**' if r['pval']<0.05 else ('*' if r['pval']<0.1 else ''))
+                    if 'fe_beta' in r: cx_b=f"{r['fe_beta']:.4f}{s}"
+                    elif 'ols_params' in r and len(r['ols_params'])>1:
+                        pk=list(r['ols_params'].keys())[1]; cx_b=f"{r['ols_params'][pk]['b']:.4f}{s}"
+                    tbl.append({'#':i+1,'控制组合':cs,'β(SE)':cx_b,'|t|':f"{abs(r['tstat']):.2f}",
+                        'R²':f"{r.get('fe_rsq',r.get('rsq',0)):.3f}",'N':r['n']})
+            n_sig05=sum(1 for r in results if (r.get('min_abs_tstat',abs(r.get('tstat',0))) if is_joint else abs(r['tstat']))>stats.t.ppf(0.975,df=max(r['n']-5,1)))
+            expander_label=f"**{cx}** — {len(results)}组合 ｜ {'min|t|' if is_joint else '|t|'}>1.96占 {n_sig05/max(len(results),1)*100:.0f}%"
             with st.expander(expander_label,expanded=True):
                 st.dataframe(pd.DataFrame(tbl),use_container_width=True,hide_index=True)
 
@@ -539,12 +681,12 @@ if st.session_state.df is not None:
                 if sel_key not in st.session_state: st.session_state[sel_key]=list(combo_labels.keys())[0]
                 sel=st.selectbox(f"选择 {cx} 的组合",list(combo_labels.keys()),key=sel_key)
                 chosen=combo_labels[sel]; ctrls=list(chosen['controls']); N_eff=chosen['n']
-                model_line=f"{y_col} = {cx} + [{', '.join(ctrls[:6])}{' +...' if len(ctrls)>6 else ''}]"
-
-                st.divider(); st.markdown("### 完整回归结果")
-                st.markdown(f"**模型设定**: {model_line}（{model_sel}）")
-
-                Xv0=[cx]+ctrls
+                if is_joint:
+                    model_line=f"{y_col} = {' + '.join(jcx_keys)} + [{', '.join(ctrls[:6])}{' +...' if len(ctrls)>6 else ''}]"
+                    Xv0=jcx_keys+ctrls
+                else:
+                    model_line=f"{y_col} = {cx} + [{', '.join(ctrls[:6])}{' +...' if len(ctrls)>6 else ''}]"
+                    Xv0=[cx]+ctrls
 
                 # ═══ 根据模型类型跑完整回归 ═══
                 if is_panel and 'FE+RE' in model_sel:
@@ -573,10 +715,12 @@ if st.session_state.df is not None:
                     se_n="聚类稳健" if chosen.get('cluster_ok') else "普通稳健"
                     st.caption(f"注：{se_n}SE。*** p<0.01, ** p<0.05, * p<0.10。\nN={N_eff}｜个体={n_id}｜时期={n_t}\n含个体+时间固定效应\nFE R²={chosen['fe_rsq']:.4f}｜RE R²={chosen['re_rsq']:.4f}")
                     do=(f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* {model_line}\n\nuse \"data.dta\", clear\nxtset {id_col} {tc_col}\n\n")
-                    if chosen.get('cluster_ok'): do+=f"reghdfe {y_col} {cx} {' '.join(ctrls)}, absorb({id_col} {tc_col}) vce(cluster {id_col})\n"
+                    if use_cl and not chosen.get('cluster_ok'):
+                        st.warning("Python 聚类SE估计失败（已降级为普通SE），但 Stata 代码保留了 vce(cluster) 设定，请在 Stata 中验证")
+                    if use_cl: do+=f"reghdfe {y_col} {cx} {' '.join(ctrls)}, absorb({id_col} {tc_col}) vce(cluster {id_col})\n"
                     else: do+=f"reghdfe {y_col} {cx} {' '.join(ctrls)}, absorb({id_col} {tc_col})\n"
                     do+="est sto fe\n\n"
-                    if chosen.get('cluster_ok'): do+=f"xtreg {y_col} {cx} {' '.join(ctrls)}, re vce(cluster {id_col})\n"
+                    if use_cl: do+=f"xtreg {y_col} {cx} {' '.join(ctrls)}, re vce(cluster {id_col})\n"
                     else: do+=f"xtreg {y_col} {cx} {' '.join(ctrls)}, re\n"
                     do+="est sto re\nhausman fe re\n"
                     with st.expander("Stata 复现代码"): st.code(do,language='stata')
@@ -616,7 +760,7 @@ if st.session_state.df is not None:
                         dl1.download_button("下载 .do",do,file_name=f"{cx}_did.do",key=f'dl_{cx}_did_v7')
                     except Exception as e: st.error(f"DID 失败：{e}")
 
-                elif model_sel.startswith('OLS'):
+                elif model_sel.startswith('OLS') or 'Pooled' in model_sel:
                     td=sub[[y_col]+Xv0].dropna(); Xd=sm.add_constant(td[Xv0])
                     use_rob='稳健' in model_sel; cov_t='HC1' if use_rob else 'nonrobust'
                     m=OLS(td[y_col].values,Xd).fit(cov_type=cov_t)
