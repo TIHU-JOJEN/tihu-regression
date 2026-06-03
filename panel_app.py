@@ -148,6 +148,117 @@ def detect_y_type(y_series):
     if atmin>0.05 or atmax>0.05: return 'censored',{'at_min':atmin,'y_min':y.min()}
     return 'continuous',None
 
+def run_mediation_wen2014(y_col, x, m, controls, df, n_boot=1000):
+    """温忠麟 & 叶宝娟 (2014) 中介效应五步流程
+    方程: (1) Y=cX (2) M=aX (3) Y=c'X+bM
+    步骤: ①检验c ②依次检验a,b ③Bootstrap检验ab ④检验c' ⑤比较ab与c'符号"""
+    ctrls=list(controls); td=df[[y_col,x,m]+ctrls].dropna()
+    n=len(td)
+    if n<30: return None
+    # 方程(1): Y ~ X + controls → 总效应 c
+    m1=OLS(td[y_col],sm.add_constant(td[[x]+ctrls])).fit()
+    c,c_se,c_p=float(m1.params[x]),float(m1.bse[x]),float(m1.pvalues[x])
+    # 方程(2): M ~ X + controls → a
+    m2=OLS(td[m],sm.add_constant(td[[x]+ctrls])).fit()
+    a,a_se,a_p=float(m2.params[x]),float(m2.bse[x]),float(m2.pvalues[x])
+    # 方程(3): Y ~ X + M + controls → c' + b
+    m3=OLS(td[y_col],sm.add_constant(td[[x,m]+ctrls])).fit()
+    b,b_se,b_p=float(m3.params[m]),float(m3.bse[m]),float(m3.pvalues[m])
+    cp,cp_se,cp_p=float(m3.params[x]),float(m3.bse[x]),float(m3.pvalues[x])
+    ab=a*b
+    # ── 步骤1: 检验系数 c ──
+    framework='中介效应' if c_p<0.05 else '遮掩效应'
+    # ── 步骤2: 依次检验 a 和 b ──
+    ab_both_sig=(a_p<0.05) and (b_p<0.05)
+    # ── 步骤3: Bootstrap 检验 H0: ab=0（当步骤2至少一个不显著时）──
+    boot_ci=None; boot_sig=None
+    if not ab_both_sig:
+        boot_abs=[]
+        rng=np.random.RandomState(42)
+        for _ in range(n_boot):
+            idx=rng.choice(n,n,replace=True); btd=td.iloc[idx]
+            try:
+                ba=float(OLS(btd[m],sm.add_constant(btd[[x]+ctrls])).fit().params[x])
+                bb=float(OLS(btd[y_col],sm.add_constant(btd[[x,m]+ctrls])).fit().params[m])
+                boot_abs.append(ba*bb)
+            except: pass
+        if len(boot_abs)>=100:
+            ba_arr=np.array(boot_abs)
+            boot_ci=(float(np.percentile(ba_arr,2.5)),float(np.percentile(ba_arr,97.5)))
+            boot_sig=not (boot_ci[0]<=0<=boot_ci[1])
+    # 间接效应是否显著？
+    indirect_sig=ab_both_sig or (boot_sig if boot_sig is not None else False)
+    # ── 步骤4+5: 检验 c' 并比较符号 ──
+    if not indirect_sig:
+        judgement='间接效应不显著，停止分析'; effect_type='无中介'; effect_size=None
+    elif cp_p>=0.05:  # c' 不显著 → 完全中介
+        judgement='c\' 不显著 → 只有中介效应（完全中介）'; effect_type='完全中介'; effect_size=None
+    elif ab*cp>0:  # ab 与 c' 同号 → 部分中介
+        es=ab/c if c!=0 else 0
+        judgement=f'ab 与 c\' 同号 → 部分中介效应（ab/c={es:.3f}）'; effect_type='部分中介'; effect_size=es
+    else:  # ab 与 c' 异号 → 遮掩效应
+        es=abs(ab/cp) if cp!=0 else 0
+        judgement=f'ab 与 c\' 异号 → 遮掩效应（|ab/c\'|={es:.3f}）'; effect_type='遮掩效应'; effect_size=es
+    return {'c':c,'c_se':c_se,'c_p':c_p,
+            'a':a,'a_se':a_se,'a_p':a_p,
+            'b':b,'b_se':b_se,'b_p':b_p,
+            'cp':cp,'cp_se':cp_se,'cp_p':cp_p,
+            'ab':ab,'ab_both_sig':ab_both_sig,
+            'boot_ci':boot_ci,'boot_sig':boot_sig,'indirect_sig':indirect_sig,
+            'judgement':judgement,'effect_type':effect_type,'effect_size':effect_size,
+            'framework':framework,'n':n,
+            'r2_step1':float(m1.rsquared),'r2_step2':float(m2.rsquared),'r2_step3':float(m3.rsquared),
+            'method':'温忠麟五步流程（2014）'}
+
+def run_mediation_jiang(y_col, x, m, controls, df):
+    """江艇 (2022) 渠道检验两步法：仅验证 D→M 前半段，不分解效应
+    前提：M 与 Y 的因果关系在理论上足够直观，不需正式因果推断来论证 M→Y"""
+    ctrls=list(controls); td=df[[y_col,x,m]+ctrls].dropna()
+    if len(td)<30: return None
+    # 第1步: 验证总效应 D→Y 存在
+    m1=OLS(td[y_col],sm.add_constant(td[[x]+ctrls])).fit()
+    c,c_se,c_p=float(m1.params[x]),float(m1.bse[x]),float(m1.pvalues[x])
+    # 第2步: 验证 D→M 渠道
+    m2=OLS(td[m],sm.add_constant(td[[x]+ctrls])).fit()
+    a,a_se,a_p=float(m2.params[x]),float(m2.bse[x]),float(m2.pvalues[x])
+    # 判断：只基于两步，不估计 c'（M 内生导致分解不可信）
+    if c_p<0.05 and a_p<0.05: judgement='渠道成立：X→Y 显著（总效应存在）且 X→M 显著（渠道前半段成立）'
+    elif c_p<0.05: judgement='渠道不成立：X→Y 显著但 X→M 不显著，无法证明该渠道存在'
+    else: judgement='渠道不成立：X→Y 不显著，总效应不存在则渠道检验无意义'
+    return {'c':c,'c_se':c_se,'c_p':c_p,
+            'a':a,'a_se':a_se,'a_p':a_p,
+            'judgement':judgement,'n':len(td),
+            'r2_step1':float(m1.rsquared),'r2_step2':float(m2.rsquared),
+            'method':'江艇渠道检验两步法（2022）',
+            'note':'注意：本方法不估计 Y~X+M 方程，因 M 可能内生导致直接/间接效应分解不可信（江艇, 2022）。M 与 Y 的因果关系需由理论支撑，而非统计检验。'}
+
+def run_moderation_analysis(y_col, x, m, controls, df):
+    """调节效应：Y ~ X + M + X×M + controls, 简单斜率"""
+    ctrls=list(controls); td=df[[y_col,x,m]+ctrls].dropna().copy()
+    if len(td)<30: return None
+    td['_inter']=td[x]*td[m]
+    Xv=[x,m,'_inter']+ctrls; Xd=sm.add_constant(td[Xv])
+    mf=OLS(td[y_col],Xd).fit()
+    b_x=float(mf.params[x]); b_inter=float(mf.params['_inter'])
+    se_inter=float(mf.bse['_inter']); p_inter=float(mf.pvalues['_inter'])
+    m_mean,m_sd=float(td[m].mean()),float(td[m].std())
+    vcov=mf.cov_params()
+    def simple_slope(mv):
+        slope=b_x+b_inter*mv
+        vs=vcov.loc[x,x]+mv**2*vcov.loc['_inter','_inter']+2*mv*vcov.loc[x,'_inter']
+        se_s=np.sqrt(vs) if vs>0 else 0
+        return slope,se_s,slope/se_s if se_s>0 else 0
+    lo_s,lo_se,lo_t=simple_slope(m_mean-m_sd)
+    md_s,md_se,md_t=simple_slope(m_mean)
+    hi_s,hi_se,hi_t=simple_slope(m_mean+m_sd)
+    return {'b_x':b_x,'b_m':float(mf.params[m]),'b_inter':b_inter,
+            'se_inter':se_inter,'p_inter':p_inter,
+            'm_mean':m_mean,'m_sd':m_sd,
+            'low_slope':lo_s,'low_se':lo_se,'low_t':lo_t,
+            'med_slope':md_s,'med_se':md_se,'med_t':md_t,
+            'high_slope':hi_s,'high_se':hi_se,'high_t':hi_t,
+            'rsq':float(mf.rsquared),'n':len(td)}
+
 # ═══════════════════ STEP 1: 上传 ═══════════════════
 st.header("Step 1 · 上传数据")
 uploaded = st.file_uploader("拖拽 .dta / .csv / .xlsx", type=['dta','csv','xlsx'])
@@ -318,6 +429,9 @@ if st.session_state.df is not None:
             else: model_options=['OLS','OLS+稳健SE','Tobit（如被截断）','Heckman（样本选择）']
             model_options.append('PSM（倾向得分匹配）')
             model_options.append('IV/2SLS（工具变量）')
+            if y_type=='continuous':
+                model_options.append('中介效应（X→M→Y）')
+                model_options.append('调节效应（X×M 交互）')
             if cat_cols:
                 if y_type in ['continuous','censored']:
                     model_options.append('ANOVA/组间比较（分类变量）')
@@ -353,27 +467,6 @@ if st.session_state.df is not None:
         bin_m=None; did_var=None; heckman_sel=None
         iv_endog=None; iv_insts=[]
         if dt=='panel':
-            if 'FE+RE' in sel_model:
-                n_u=st.session_state.n_units
-                if n_u>=30:   rec_se,rec_msg='cluster',f"推荐：聚类到 {id_col}（{n_u} 个体，组内相关需聚类SE）"
-                elif n_u>=10: rec_se,rec_msg='robust',f"推荐：稳健SE（仅 {n_u} 个体，聚类不可靠，改用异方差稳健）"
-                else:         rec_se,rec_msg='ordinary',f"推荐：普通SE（仅 {n_u} 个体）"
-                se_choice=st.radio("标准误（SE）",
-                    ["💡 智能推荐","聚类 SE","稳健 SE (HC1)","普通 SE"],
-                    horizontal=True,key='semode7')
-                if '智能' in se_choice:
-                    st.info(rec_msg)
-                    se_mode=rec_se
-                elif '聚类' in se_choice: se_mode='cluster'
-                elif '稳健' in se_choice: se_mode='robust'
-                else:                      se_mode='ordinary'
-                use_cl=(se_mode=='cluster')
-                use_rob=(se_mode in ('robust','cluster'))
-                if use_cl:
-                    cluster_opts=[id_col]+[c for c in cols if c not in [id_col,tc] and (c in cat_cols or (pd.api.types.is_numeric_dtype(df[c]) and 2<=df[c].nunique()<=30))]
-                    cluster_col=st.selectbox("聚类变量",cluster_opts,index=0,key='cl7')
-                else:
-                    cluster_col=None
             if 'DID' in sel_model and 'PSM' not in sel_model:
                 did_var=st.selectbox("处理变量（二分，1=处理组）",bin_vars,key='did7')
                 st.caption("模型将自动创建 Post×Treat 交互项")
@@ -389,7 +482,52 @@ if st.session_state.df is not None:
             if 'Heckman' in sel_model:
                 heckman_sel=st.selectbox("选择变量（二分，1=被观测到）",[c for c in rem if len(df_aug[c].dropna().unique())==2],key='hks7')
 
+        # 中介/调节特有选项
+        med_m=None; mod_m=None; med_method='温忠麟五步流程（2014）'
+        if '中介' in sel_model:
+            med_opts=[c for c in all_num if c not in excl and c!=y_col and c not in core_x]
+            med_m=st.selectbox("中介变量 M",med_opts,key='medm7') if med_opts else None
+            med_method=st.radio("中介方法",['温忠麟五步流程（2014）','江艇渠道检验（2022）'],horizontal=True,key='medmethod7')
+            if not med_opts: st.warning("无可用的中介变量")
+        if '调节' in sel_model:
+            mod_opts=[c for c in all_num if c not in excl and c!=y_col and c not in core_x]
+            mod_m=st.selectbox("调节变量 M",mod_opts,key='modm7') if mod_opts else None
+            if not mod_opts: st.warning("无可用的调节变量")
+
+        # ── 共享 SE 选择器（适用大多数模型）──
+        se_skip_models=['Tobit','Ordered','ANOVA','分组面板','交互效应','PSM','IV','Heckman','OLS+稳健SE','PSM-DID','中介','调节']
+        se_show=not any(sk in sel_model for sk in se_skip_models)
+        if se_show:
+            n_u=st.session_state.get('n_units',0) if dt=='panel' else 0
+            if dt=='panel' and n_u>=30:   rec_se,rec_msg='cluster',f"推荐：聚类到 {id_col}（{n_u} 个体，组内相关需聚类SE）"
+            elif dt=='panel' and n_u>=10: rec_se,rec_msg='robust',f"推荐：稳健SE（仅 {n_u} 个体，聚类不可靠）"
+            elif dt=='panel':             rec_se,rec_msg='ordinary',f"推荐：普通SE（仅 {n_u} 个体）"
+            else:                         rec_se,rec_msg='robust',f"推荐：稳健SE（HC1，异方差稳健）"
+            se_choice=st.radio("标准误（SE）",
+                ["💡 智能推荐","聚类 SE","稳健 SE (HC1)","普通 SE"],
+                horizontal=True,key='semode7')
+            if '智能' in se_choice:
+                st.info(rec_msg); se_mode=rec_se
+            elif '聚类' in se_choice: se_mode='cluster'
+            elif '稳健' in se_choice: se_mode='robust'
+            else:                      se_mode='ordinary'
+            use_cl=(se_mode=='cluster')
+            use_rob=(se_mode in ('robust','cluster'))
+            if use_cl:
+                if dt=='panel':
+                    cluster_opts=[id_col]+[c for c in cols if c not in [id_col,tc] and (c in cat_cols or (pd.api.types.is_numeric_dtype(df[c]) and 2<=df[c].nunique()<=30))]
+                else:
+                    cluster_opts=[c for c in cols if c in cat_cols or (pd.api.types.is_numeric_dtype(df[c]) and 2<=df[c].nunique()<=30)]
+                cluster_col=st.selectbox("聚类变量",cluster_opts,index=0,key='cl7') if cluster_opts else None
+                if not cluster_opts: st.warning("无可用的聚类变量"); use_cl=False
+            else:
+                cluster_col=None
+        else:
+            se_mode='ordinary'; use_cl=False; use_rob=False; cluster_col=None
+
         btn_label="开始搜索最优控制组合"
+        if ('中介' in sel_model or '调节' in sel_model) and '同时' in search_mode and len(core_x)>1:
+            st.info("中介/调节效应建议使用「分别显著」模式，将对每个核心X单独分析")
         if st.button(btn_label,type="primary",key='srch7'):
             if not core_x: st.warning("请选核心 X")
             elif not ctrl_pool or len(ctrl_pool)<2: st.warning("候选池需 ≥2 个变量")
@@ -674,6 +812,35 @@ if st.session_state.df is not None:
                             sr[cx]=search_ols(cx,ctrl_pool,amn,amx)[:50]
                         stxt.text(f"{cx}: {len(sr[cx])} 个有效组合")
                 progress.progress(1.0)
+                # ── 两阶段：中介/调节 → 在显著组合上跑第二阶段的效应分析 ──
+                med_results=None; mod_results=None
+                if '中介' in sel_model and med_m:
+                    med_results={}; is_wen='温忠麟' in med_method
+                    for cx_key in (sr.keys() if sr else []):
+                        if cx_key not in core_x: continue  # skip joint keys
+                        rlist=sr[cx_key]; top_sig=[r for r in rlist[:20] if r.get('pval',1)<0.1][:10]
+                        if not top_sig: top_sig=rlist[:5]
+                        cx_meds=[]
+                        for i,r in enumerate(top_sig):
+                            ctrls=list(r['controls'])
+                            if is_wen:
+                                mr=run_mediation_wen2014(y_col,cx_key,med_m,ctrls,df_aug)
+                            else:
+                                mr=run_mediation_jiang(y_col,cx_key,med_m,ctrls,df_aug)
+                            if mr: mr['controls']=ctrls; mr['cx']=cx_key; mr['combo_idx']=i; cx_meds.append(mr)
+                        if cx_meds: med_results[cx_key]=cx_meds
+                if '调节' in sel_model and mod_m:
+                    mod_results={}
+                    for cx_key in (sr.keys() if sr else []):
+                        if cx_key not in core_x: continue
+                        rlist=sr[cx_key]; top_sig=[r for r in rlist[:20] if r.get('pval',1)<0.1][:10]
+                        if not top_sig: top_sig=rlist[:5]
+                        cx_mods=[]
+                        for i,r in enumerate(top_sig):
+                            ctrls=list(r['controls'])
+                            mr=run_moderation_analysis(y_col,cx_key,mod_m,ctrls,df_aug)
+                            if mr: mr['controls']=ctrls; mr['cx']=cx_key; mr['combo_idx']=i; cx_mods.append(mr)
+                        if cx_mods: mod_results[cx_key]=cx_mods
                 st.success(f"完成！{time.time()-t0:.1f}s")
                 st.session_state.search_results=sr
                 st.session_state._y=y_col; st.session_state._y_type=y_type
@@ -691,6 +858,9 @@ if st.session_state.df is not None:
                 st.session_state._group_var=group_var
                 st.session_state._df_aug=df_aug
                 st.session_state._cat_cols=cat_cols
+                st.session_state._med_results=med_results; st.session_state._mod_results=mod_results
+                st.session_state._med_m=med_m; st.session_state._mod_m=mod_m
+                st.session_state._med_method=med_method
 
     # ═══════════════════ STEP 4: 结果 ═══════════════════
     if st.session_state.search_results is not None:
@@ -845,7 +1015,7 @@ if st.session_state.df is not None:
 
                 elif model_sel.startswith('OLS') or 'Pooled' in model_sel:
                     td=sub[[y_col]+Xv0].dropna(); Xd=sm.add_constant(td[Xv0])
-                    use_rob='稳健' in model_sel; cov_t='HC1' if use_rob else 'nonrobust'
+                    cov_t='HC1' if use_rob else 'nonrobust'
                     m=OLS(td[y_col].values,Xd).fit(cov_type=cov_t)
                     rows=[]
                     for j,vn in enumerate(['const']+Xv0):
@@ -853,8 +1023,12 @@ if st.session_state.df is not None:
                         s='***' if pv<0.01 else ('**' if pv<0.05 else ('*' if pv<0.1 else ''))
                         rows.append({'变量':vn,'系数':f"{b:.4f}{s}",'SE':f"({se:.4f})",'t':f"{t:.2f}",'p':f"{pv:.4f}"})
                     st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
-                    st.caption(f"OLS（{'HC1稳健' if use_rob else '普通'}SE）｜N={len(td)}｜R²={m.rsquared:.4f}｜adj R²={m.rsquared_adj:.4f}｜F={m.fvalue:.2f}(p={m.f_pvalue:.4f})")
-                    do=f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* {model_line}\n\nuse \"data.dta\", clear\nreg {y_col} {cx} {' '.join(ctrls)}{', robust' if use_rob else ''}\n"
+                    se_label='聚类稳健SE' if use_cl else ('异方差稳健SE (HC1)' if use_rob else '普通SE')
+                    st.caption(f"OLS（{se_label}）｜N={len(td)}｜R²={m.rsquared:.4f}｜adj R²={m.rsquared_adj:.4f}｜F={m.fvalue:.2f}(p={m.f_pvalue:.4f})")
+                    if use_cl and cluster_col: stata_se=f', vce(cluster {cluster_col})'
+                    elif use_rob: stata_se=', robust'
+                    else: stata_se=''
+                    do=f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* {model_line}\n\nuse \"data.dta\", clear\nreg {y_col} {cx} {' '.join(ctrls)}{stata_se}\n"
                     with st.expander("Stata 复现代码"): st.code(do,language='stata')
                     dl1,dl2=st.columns(2)
                     dl1.download_button("下载 .do",do,file_name=f"{cx}_ols.do",key=f'dlo_{cx}_v7')
@@ -865,6 +1039,9 @@ if st.session_state.df is not None:
                     rows=[]; fit_lines=[]
                     run_lg='Logit' in model_sel or '+' in model_sel; run_pr='Probit' in model_sel or '+' in model_sel
                     run_lpm='LPM' in model_sel
+                    if use_cl and cluster_col: stata_se=f', vce(cluster {cluster_col})'
+                    elif use_rob: stata_se=', robust'
+                    else: stata_se=''
                     do=f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* {model_line}\n\nuse \"data.dta\", clear\n\n"
                     if run_lg:
                         try:
@@ -874,7 +1051,7 @@ if st.session_state.df is not None:
                                 s='***' if pv<0.01 else ('**' if pv<0.05 else ('*' if pv<0.1 else ''))
                                 rows.append({'变量':vn,'Logit 系数':f"{b:.4f}{s}",'Logit SE':f"({se:.4f})"})
                             fit_lines.append(f"Logit: Pseudo R²={lf.prsquared:.4f}, LL={lf.llf:.2f}")
-                            do+=f"logit {y_col} {cx} {' '.join(ctrls)}, robust\n"
+                            do+=f"logit {y_col} {cx} {' '.join(ctrls)}{stata_se}\n"
                         except Exception as e: st.error(f"Logit: {e}")
                     if run_pr:
                         try:
@@ -887,7 +1064,7 @@ if st.session_state.df is not None:
                                         if rr['变量']==vn: rr['Probit 系数']=f"{b:.4f}{s}"; rr['Probit SE']=f"({se:.4f})"
                                 else: rows.append({'变量':vn,'Probit 系数':f"{b:.4f}{s}",'Probit SE':f"({se:.4f})"})
                             fit_lines.append(f"Probit: Pseudo R²={pf.prsquared:.4f}, LL={pf.llf:.2f}")
-                            do+=f"probit {y_col} {cx} {' '.join(ctrls)}, robust\n"
+                            do+=f"probit {y_col} {cx} {' '.join(ctrls)}{stata_se}\n"
                         except Exception as e: st.error(f"Probit: {e}")
                     if run_lpm:
                         lm=OLS(y_d,Xd).fit(cov_type='HC1')
@@ -896,7 +1073,7 @@ if st.session_state.df is not None:
                             s='***' if pv<0.01 else ('**' if pv<0.05 else ('*' if pv<0.1 else ''))
                             rows.append({'变量':vn,'LPM 系数':f"{b:.4f}{s}",'LPM SE':f"({se:.4f})"})
                         fit_lines.append(f"LPM: R²={lm.rsquared:.4f}")
-                        do+=f"reg {y_col} {cx} {' '.join(ctrls)}, robust\n"
+                        do+=f"reg {y_col} {cx} {' '.join(ctrls)}{stata_se}\n"
                     do+="\n* 边际效应\nmargins, dydx(*) post\n"
                     st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
                     st.caption(f"*** p<0.01, ** p<0.05, * p<0.10\nN={len(td)}\n"+'\n'.join(fit_lines))
@@ -925,17 +1102,22 @@ if st.session_state.df is not None:
                 elif 'Poisson' in model_sel or '负二项' in model_sel:
                     td=sub[[y_col]+Xv0].dropna(); Xd=sm.add_constant(td[Xv0]); y_d=td[y_col]
                     fam=Poisson() if 'Poisson' in model_sel else NegativeBinomial()
+                    cov_t='HC0' if use_rob else 'nonrobust'
                     try:
-                        gm=GLM(y_d,Xd,family=fam).fit()
+                        gm=GLM(y_d,Xd,family=fam).fit(cov_type=cov_t)
                         rows=[]
                         for j,vn in enumerate(['const']+Xv0):
                             b=gm.params[j]; se=gm.bse[j]; t=abs(b/se) if se>0 else 0; pv=gm.pvalues[j]
                             s='***' if pv<0.01 else ('**' if pv<0.05 else ('*' if pv<0.1 else ''))
                             rows.append({'变量':vn,'系数':f"{b:.4f}{s}",'SE':f"({se:.4f})",'z':f"{t:.2f}"})
                         st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
-                        st.caption(f"N={len(td)}｜Pseudo R²={1-gm.llf/gm.llnull:.4f}｜LL={gm.llf:.2f}")
+                        se_label='聚类稳健SE' if use_cl else ('异方差稳健SE' if use_rob else '普通SE')
+                        st.caption(f"N={len(td)}｜Pseudo R²={1-gm.llf/gm.llnull:.4f}｜LL={gm.llf:.2f}｜SE: {se_label}")
                         stcmd='poisson' if 'Poisson' in model_sel else 'nbreg'
-                        do=f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* {model_line}\n\nuse \"data.dta\", clear\n{stcmd} {y_col} {cx} {' '.join(ctrls)}, robust\nmargins, dydx(*) post\n"
+                        if use_cl and cluster_col: stata_se=f', vce(cluster {cluster_col})'
+                        elif use_rob: stata_se=', robust'
+                        else: stata_se=''
+                        do=f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* {model_line}\n\nuse \"data.dta\", clear\n{stcmd} {y_col} {cx} {' '.join(ctrls)}{stata_se}\nmargins, dydx(*) post\n"
                         with st.expander("Stata 复现代码"): st.code(do,language='stata')
                     except Exception as e: st.error(f"计数模型失败：{e}")
 
@@ -1010,6 +1192,165 @@ if st.session_state.df is not None:
                             do=f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* IV/2SLS: {model_line}\n\nuse \"data.dta\", clear\nivregress 2sls {y_col} {' '.join(exog_vars)} ({iv_endog}={' '.join(iv_insts)}), robust\nestat firststage\nestat overid\n"
                             with st.expander("Stata 复现代码"): st.code(do,language='stata')
                         except Exception as e: st.error(f"IV 失败：{e}")
+
+                # ═══ 中介效应 ═══
+                elif '中介' in model_sel:
+                    med_results=st.session_state.get('_med_results',{})
+                    med_m=st.session_state.get('_med_m',None)
+                    med_method=st.session_state.get('_med_method','温忠麟五步流程（2014）')
+                    is_wen='温忠麟' in med_method
+                    if med_results and cx in med_results:
+                        cx_meds=med_results[cx]
+                        st.subheader(f"中介效应：{cx} → {med_m} → {y_col}")
+                        st.caption(f"方法：{med_method}｜在基准回归 top {len(cx_meds)} 个显著组合上运行")
+                        med_tbl=[]
+                        for mi,mr in enumerate(cx_meds):
+                            cs=', '.join(mr['controls'][:3])
+                            if len(mr['controls'])>3: cs+=f'...+{len(mr["controls"])-3}'
+                            if is_wen:
+                                med_tbl.append({'#':mi+1,'控制组合':cs,
+                                    'c(总效应)':f"{mr['c']:.4f}",'a':f"{mr['a']:.4f}",
+                                    'b':f"{mr['b']:.4f}",'c\'':f"{mr['cp']:.4f}",
+                                    '间接ab':f"{mr['ab']:.4f}",'判断':mr['effect_type']})
+                            else:
+                                med_tbl.append({'#':mi+1,'控制组合':cs,
+                                    'c(X→Y)':f"{mr['c']:.4f}{'***' if mr['c_p']<0.01 else ('**' if mr['c_p']<0.05 else ('*' if mr['c_p']<0.1 else ''))}",
+                                    'a(X→M)':f"{mr['a']:.4f}{'***' if mr['a_p']<0.01 else ('**' if mr['a_p']<0.05 else ('*' if mr['a_p']<0.1 else ''))}",
+                                    '判断':mr['judgement'][:20]+'...' if len(mr['judgement'])>20 else mr['judgement']})
+                        st.dataframe(pd.DataFrame(med_tbl),use_container_width=True,hide_index=True)
+                        chosen_ctrl_set=set(chosen['controls'])
+                        best_med=None; best_overlap=-1
+                        for mr in cx_meds:
+                            ov=len(chosen_ctrl_set & set(mr['controls']))
+                            if ov>best_overlap: best_overlap=ov; best_med=mr
+                        if best_med:
+                            st.divider(); st.caption(f"选中组合详情（控制：{', '.join(best_med['controls'][:4])}）")
+                            if is_wen:
+                                # ── 温忠麟 2014 五步流程展示 ──
+                                st.markdown("**五步检验流程**")
+                                # Step 1
+                                s1='✓' if best_med['c_p']<0.05 else '✗'
+                                st.caption(f"① 检验系数 c={best_med['c']:.4f} (p={best_med['c_p']:.4f}) {s1} → 按**{best_med['framework']}**立论")
+                                # Step 2
+                                s2a='✓' if best_med['a_p']<0.05 else '✗'; s2b='✓' if best_med['b_p']<0.05 else '✗'
+                                st.caption(f"② 依次检验 a={best_med['a']:.4f} (p={best_med['a_p']:.4f}) {s2a}, b={best_med['b']:.4f} (p={best_med['b_p']:.4f}) {s2b} → {'都显著，间接效应成立' if best_med['ab_both_sig'] else '至少一个不显著，需Bootstrap'}")
+                                # Step 3 (Bootstrap, if needed)
+                                if not best_med['ab_both_sig']:
+                                    if best_med['boot_ci']:
+                                        bci=best_med['boot_ci']; bs='✓ 显著' if best_med['boot_sig'] else '✗ 不显著'
+                                        st.caption(f"③ Bootstrap 1000次：ab 的95%CI=[{bci[0]:.4f}, {bci[1]:.4f}] → {bs}")
+                                    else:
+                                        st.caption("③ Bootstrap 失败（样本量不足）")
+                                # Step 4
+                                s4='不显著' if best_med['cp_p']>=0.05 else '显著'
+                                st.caption(f"④ 检验直接效应 c'={best_med['cp']:.4f} (p={best_med['cp_p']:.4f}) → {s4}")
+                                # Step 5
+                                if best_med['effect_type'] not in ['无中介','完全中介']:
+                                    ab_sign='同号' if best_med['ab']*best_med['cp']>0 else '异号'
+                                    st.caption(f"⑤ ab({best_med['ab']:.4f}) 与 c'({best_med['cp']:.4f}) {ab_sign}")
+                                # 最终判断
+                                if best_med['effect_type'] in ['部分中介','完全中介']:
+                                    es_str=f"，效应量={best_med['effect_size']:.3f}" if best_med['effect_size'] is not None else ''
+                                    st.success(f"结论：{best_med['effect_type']}{es_str}")
+                                elif best_med['effect_type']=='遮掩效应':
+                                    st.warning(f"结论：{best_med['effect_type']}，|ab/c'|={best_med['effect_size']:.3f}")
+                                else:
+                                    st.warning(f"结论：{best_med['effect_type']}")
+                                # 汇总指标
+                                c1,c2,c3=st.columns(3)
+                                with c1: st.metric("总效应 c",f"{best_med['c']:.4f}")
+                                with c2: st.metric("直接效应 c'",f"{best_med['cp']:.4f}")
+                                with c3: st.metric("间接效应 ab",f"{best_med['ab']:.4f}")
+                                # Bootstrap CI (if available)
+                                if best_med.get('boot_ci'):
+                                    c4,c5=st.columns(2)
+                                    with c4: st.caption(f"Bootstrap 95%CI: [{best_med['boot_ci'][0]:.4f}, {best_med['boot_ci'][1]:.4f}]")
+                                    with c5: st.caption(f"R²: step1={best_med['r2_step1']:.3f}, step3={best_med['r2_step3']:.3f}")
+                                else:
+                                    st.caption(f"R²: step1={best_med['r2_step1']:.3f}, step2={best_med['r2_step2']:.3f}, step3={best_med['r2_step3']:.3f}")
+                                # Stata 代码
+                                do=f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n"
+                                do+=f"* 中介效应（温忠麟五步流程 2014）: {cx} → {med_m} → {y_col}\n\nuse \"data.dta\", clear\n"
+                                do+=f"* 步骤1: 总效应\nreg {y_col} {cx} {' '.join(best_med['controls'])}, robust\n"
+                                do+=f"* 步骤2: X→M 和 直接效应+中介\nreg {med_m} {cx} {' '.join(best_med['controls'])}, robust\n"
+                                do+=f"reg {y_col} {cx} {med_m} {' '.join(best_med['controls'])}, robust\n"
+                                do+=f"* 步骤3: Bootstrap 检验间接效应 ab\n"
+                                do+=f"capture program drop bootmed\nprogram define bootmed, rclass\n"
+                                do+=f"  reg {med_m} {cx} {' '.join(best_med['controls'])}\n"
+                                do+=f"  local a=_b[{cx}]\n  reg {y_col} {cx} {med_m} {' '.join(best_med['controls'])}\n"
+                                do+=f"  local b=_b[{med_m}]\n  return scalar indirect=`a'*`b'\nend\n"
+                                do+=f"bootstrap r(indirect), reps(1000) seed(42): bootmed\nestat bootstrap, percentile bc\n"
+                                with st.expander("Stata 复现代码"): st.code(do,language='stata')
+                            else:
+                                # ── 江艇 2022 渠道检验展示 ──
+                                st.info("**渠道检验**：仅验证 D→M 前半段因果链条，不分解直接/间接效应。"
+                                       "M 对 Y 的因果关系需由理论支撑（江艇, 2022）。")
+                                c1,c2=st.columns(2)
+                                with c1: st.metric("第1步: X→Y (总效应 c)",f"{best_med['c']:.4f}",
+                                    f"p={best_med['c_p']:.4f} {'✓' if best_med['c_p']<0.05 else '✗'}")
+                                with c2: st.metric("第2步: X→M (渠道 a)",f"{best_med['a']:.4f}",
+                                    f"p={best_med['a_p']:.4f} {'✓' if best_med['a_p']<0.05 else '✗'}")
+                                st.caption(f"R²: step1={best_med['r2_step1']:.3f}, step2={best_med['r2_step2']:.3f}")
+                                st.caption(best_med.get('note',''))
+                                if '成立' in best_med['judgement']: st.success(best_med['judgement'])
+                                else: st.warning(best_med['judgement'])
+                                do=f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n"
+                                do+=f"* 渠道检验（江艇 2022）: {cx} → {med_m} → {y_col}\n"
+                                do+=f"* 注意：仅检验 D→M 前半段，不分解效应（M 内生导致分解不可信）\n\n"
+                                do+=f"use \"data.dta\", clear\n"
+                                do+=f"* 第1步: 总效应 D→Y 必须存在\nreg {y_col} {cx} {' '.join(best_med['controls'])}, robust\n"
+                                do+=f"* 第2步: D→M 渠道必须显著\nreg {med_m} {cx} {' '.join(best_med['controls'])}, robust\n"
+                                with st.expander("Stata 复现代码"): st.code(do,language='stata')
+                    else:
+                        st.info("未找到有效中介分析结果，请确保基准回归中有显著组合")
+
+                # ═══ 调节效应 ═══
+                elif '调节' in model_sel:
+                    mod_results=st.session_state.get('_mod_results',{})
+                    mod_m=st.session_state.get('_mod_m',None)
+                    if mod_results and cx in mod_results:
+                        cx_mods=mod_results[cx]
+                        st.subheader(f"调节效应：{cx} × {mod_m} → {y_col}")
+                        st.caption(f"在基准回归 top {len(cx_mods)} 个显著组合上运行")
+                        mod_tbl=[]
+                        for mi,mr in enumerate(cx_mods):
+                            cs=', '.join(mr['controls'][:3])
+                            if len(mr['controls'])>3: cs+=f'...+{len(mr["controls"])-3}'
+                            s='***' if mr['p_inter']<0.01 else ('**' if mr['p_inter']<0.05 else ('*' if mr['p_inter']<0.1 else ''))
+                            mod_tbl.append({'#':mi+1,'控制组合':cs,
+                                'X系数':f"{mr['b_x']:.4f}",'交互项':f"{mr['b_inter']:.4f}{s}",
+                                '低M斜率':f"{mr['low_slope']:.4f}",'中M斜率':f"{mr['med_slope']:.4f}",
+                                '高M斜率':f"{mr['high_slope']:.4f}",'N':mr['n']})
+                        st.dataframe(pd.DataFrame(mod_tbl),use_container_width=True,hide_index=True)
+                        chosen_ctrl_set=set(chosen['controls'])
+                        best_mod=None; best_overlap=-1
+                        for mr in cx_mods:
+                            ov=len(chosen_ctrl_set & set(mr['controls']))
+                            if ov>best_overlap: best_overlap=ov; best_mod=mr
+                        if best_mod:
+                            st.divider(); st.caption(f"选中组合的调节效应详情（控制：{', '.join(best_mod['controls'][:4])}）")
+                            c1,c2,c3=st.columns(3)
+                            with c1: st.metric(f"{cx} 主效应",f"{best_mod['b_x']:.4f}")
+                            with c2: st.metric(f"{mod_m} 主效应",f"{best_mod['b_m']:.4f}")
+                            with c3: st.metric(f"交互项 {cx}×{mod_m}",f"{best_mod['b_inter']:.4f}",
+                                f"p={best_mod['p_inter']:.4f}")
+                            st.divider(); st.caption(f"简单斜率分析（{mod_m} 均值±1SD）")
+                            m_mu=best_mod['m_mean']; m_sd=best_mod['m_sd']
+                            c4,c5,c6=st.columns(3)
+                            with c4: st.metric(f"低 {mod_m} ({m_mu-m_sd:.2f})",f"{best_mod['low_slope']:.4f}",
+                                f"t={best_mod['low_t']:.2f}")
+                            with c5: st.metric(f"中 {mod_m} ({m_mu:.2f})",f"{best_mod['med_slope']:.4f}",
+                                f"t={best_mod['med_t']:.2f}")
+                            with c6: st.metric(f"高 {mod_m} ({m_mu+m_sd:.2f})",f"{best_mod['high_slope']:.4f}",
+                                f"t={best_mod['high_t']:.2f}")
+                            if best_mod['p_inter']<0.05: st.success(f"调节效应显著：{mod_m} 显著调节 {cx}→{y_col} 的关系")
+                            else: st.warning("调节效应不显著")
+                            do=f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* 调节效应: {cx} × {mod_m} → {y_col}\n\nuse \"data.dta\", clear\n"
+                            do+=f"reg {y_col} c.{cx}##c.{mod_m} {' '.join(best_mod['controls'])}, robust\n"
+                            do+=f"margins, dydx({cx}) at({mod_m}=({m_mu-m_sd:.2f} {m_mu:.2f} {m_mu+m_sd:.2f}))\nmarginsplot\n"
+                            with st.expander("Stata 复现代码"): st.code(do,language='stata')
+                    else:
+                        st.info("未找到有效调节效应结果，请确保基准回归中有显著组合")
 
                 # ═══ ANOVA/组间比较 ═══
                 elif 'ANOVA' in model_sel:
