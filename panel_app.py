@@ -1314,7 +1314,7 @@ if st.session_state.df is not None:
                     m=OLS(td[y_col].values,Xd).fit(cov_type=cov_t)
                     rows=[]
                     for j,vn in enumerate(['const']+Xv0):
-                        b=m.params[j]; se=m.bse[j]; t=abs(b/se) if se>0 else 0; pv=m.pvalues[j]
+                        b=m.params[vn]; se=m.bse[vn]; t=abs(b/se) if se>0 else 0; pv=m.pvalues[vn]
                         s='***' if pv<0.01 else ('**' if pv<0.05 else ('*' if pv<0.1 else ''))
                         rows.append({'变量':vn,'系数':f"{b:.4f}{s}",'SE':f"({se:.4f})",'t':f"{t:.2f}",'p':f"{pv:.4f}"})
                     st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
@@ -1343,7 +1343,7 @@ if st.session_state.df is not None:
                         try:
                             lf=sm.Logit(y_d,Xd).fit(disp=0)
                             for j,vn in enumerate(['const']+Xv0):
-                                b=lf.params[j]; se=lf.bse[j]; t=abs(b/se) if se>0 else 0; pv=2*(1-stats.norm.cdf(t))
+                                b=lf.params[vn]; se=lf.bse[vn]; t=abs(b/se) if se>0 else 0; pv=2*(1-stats.norm.cdf(t))
                                 s='***' if pv<0.01 else ('**' if pv<0.05 else ('*' if pv<0.1 else ''))
                                 rows.append({'变量':vn,'Logit 系数':f"{b:.4f}{s}",'Logit SE':f"({se:.4f})"})
                             fit_lines.append(f"Logit: Pseudo R²={lf.prsquared:.4f}, LL={lf.llf:.2f}")
@@ -1353,7 +1353,7 @@ if st.session_state.df is not None:
                         try:
                             pf=sm.Probit(y_d,Xd).fit(disp=0)
                             for j,vn in enumerate(['const']+Xv0):
-                                b=pf.params[j]; se=pf.bse[j]; t=abs(b/se) if se>0 else 0; pv=2*(1-stats.norm.cdf(t))
+                                b=pf.params[vn]; se=pf.bse[vn]; t=abs(b/se) if se>0 else 0; pv=2*(1-stats.norm.cdf(t))
                                 s='***' if pv<0.01 else ('**' if pv<0.05 else ('*' if pv<0.1 else ''))
                                 if run_lg:
                                     for rr in rows:
@@ -1365,7 +1365,7 @@ if st.session_state.df is not None:
                         do+=f"reg {y_col} {cx} {' '.join(ctrls)}{stata_se}\n"
                         lm=OLS(y_d,Xd).fit(cov_type='HC1')
                         for j,vn in enumerate(['const']+Xv0):
-                            b=lm.params[j]; se=lm.bse[j]; pv=lm.pvalues[j]
+                            b=lm.params[vn]; se=lm.bse[vn]; pv=lm.pvalues[vn]
                             s='***' if pv<0.01 else ('**' if pv<0.05 else ('*' if pv<0.1 else ''))
                             rows.append({'变量':vn,'LPM 系数':f"{b:.4f}{s}",'LPM SE':f"({se:.4f})"})
                         fit_lines.append(f"LPM: R²={lm.rsquared:.4f}")
@@ -1386,7 +1386,7 @@ if st.session_state.df is not None:
                         om=OrderedModel(y_d,Xd,distr=dist).fit(disp=0)
                         rows=[]
                         for j,vn in enumerate(Xv0):
-                            b=om.params[j]; se=om.bse[j]; t=abs(b/se) if se>0 else 0; pv=2*(1-stats.norm.cdf(t))
+                            b=om.params[vn]; se=om.bse[vn]; t=abs(b/se) if se>0 else 0; pv=2*(1-stats.norm.cdf(t))
                             s='***' if pv<0.01 else ('**' if pv<0.05 else ('*' if pv<0.1 else ''))
                             rows.append({'变量':vn,'系数':f"{b:.4f}{s}",'SE':f"({se:.4f})",'z':f"{t:.2f}"})
                         st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
@@ -1407,7 +1407,7 @@ if st.session_state.df is not None:
                         gm=GLM(y_d,Xd,family=fam).fit(cov_type=cov_t)
                         rows=[]
                         for j,vn in enumerate(['const']+Xv0):
-                            b=gm.params[j]; se=gm.bse[j]; t=abs(b/se) if se>0 else 0; pv=gm.pvalues[j]
+                            b=gm.params[vn]; se=gm.bse[vn]; t=abs(b/se) if se>0 else 0; pv=gm.pvalues[vn]
                             s='***' if pv<0.01 else ('**' if pv<0.05 else ('*' if pv<0.1 else ''))
                             rows.append({'变量':vn,'系数':f"{b:.4f}{s}",'SE':f"({se:.4f})",'z':f"{t:.2f}"})
                         st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
