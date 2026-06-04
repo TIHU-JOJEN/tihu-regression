@@ -62,7 +62,7 @@ with st.sidebar:
 def tobit_mle(y, X, left=None, right=None):
     """Tobit MLE: left and/or right censored."""
     Xa=np.asarray(X,dtype=float); ya=np.asarray(y,dtype=float); k=Xa.shape[1]
-    ols=OLS(ya,Xa).fit(); b0=np.append(ols.params.values,np.log(max(ols.scale**0.5,0.01)))
+    ols=OLS(ya,Xa).fit(); ols_p=ols.params.values if hasattr(ols.params,'values') else ols.params; b0=np.append(ols_p,np.log(max(ols.scale**0.5,0.01)))
     def nll(p):
         beta=p[:k]; sigma=np.exp(p[k])
         xb=Xa@beta; ll=0.0
