@@ -1339,6 +1339,7 @@ if st.session_state.df is not None:
                     else: stata_se=''
                     do=f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* {model_line}\n\nuse \"data.dta\", clear\n\n"
                     if run_lg:
+                        do+=f"logit {y_col} {cx} {' '.join(ctrls)}{stata_se}\n"
                         try:
                             lf=sm.Logit(y_d,Xd).fit(disp=0)
                             for j,vn in enumerate(['const']+Xv0):
@@ -1346,9 +1347,9 @@ if st.session_state.df is not None:
                                 s='***' if pv<0.01 else ('**' if pv<0.05 else ('*' if pv<0.1 else ''))
                                 rows.append({'变量':vn,'Logit 系数':f"{b:.4f}{s}",'Logit SE':f"({se:.4f})"})
                             fit_lines.append(f"Logit: Pseudo R²={lf.prsquared:.4f}, LL={lf.llf:.2f}")
-                            do+=f"logit {y_col} {cx} {' '.join(ctrls)}{stata_se}\n"
-                        except Exception as e: st.error(f"Logit: {e}")
+                        except Exception as e: st.error(f"Logit 拟合失败：{e}")
                     if run_pr:
+                        do+=f"probit {y_col} {cx} {' '.join(ctrls)}{stata_se}\n"
                         try:
                             pf=sm.Probit(y_d,Xd).fit(disp=0)
                             for j,vn in enumerate(['const']+Xv0):
@@ -1359,16 +1360,15 @@ if st.session_state.df is not None:
                                         if rr['变量']==vn: rr['Probit 系数']=f"{b:.4f}{s}"; rr['Probit SE']=f"({se:.4f})"
                                 else: rows.append({'变量':vn,'Probit 系数':f"{b:.4f}{s}",'Probit SE':f"({se:.4f})"})
                             fit_lines.append(f"Probit: Pseudo R²={pf.prsquared:.4f}, LL={pf.llf:.2f}")
-                            do+=f"probit {y_col} {cx} {' '.join(ctrls)}{stata_se}\n"
-                        except Exception as e: st.error(f"Probit: {e}")
+                        except Exception as e: st.error(f"Probit 拟合失败：{e}")
                     if run_lpm:
+                        do+=f"reg {y_col} {cx} {' '.join(ctrls)}{stata_se}\n"
                         lm=OLS(y_d,Xd).fit(cov_type='HC1')
                         for j,vn in enumerate(['const']+Xv0):
                             b=lm.params[j]; se=lm.bse[j]; pv=lm.pvalues[j]
                             s='***' if pv<0.01 else ('**' if pv<0.05 else ('*' if pv<0.1 else ''))
                             rows.append({'变量':vn,'LPM 系数':f"{b:.4f}{s}",'LPM SE':f"({se:.4f})"})
                         fit_lines.append(f"LPM: R²={lm.rsquared:.4f}")
-                        do+=f"reg {y_col} {cx} {' '.join(ctrls)}{stata_se}\n"
                     do+="\n* 边际效应\nmargins, dydx(*) post\n"
                     st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
                     st.caption(f"*** p<0.01, ** p<0.05, * p<0.10\nN={len(td)}\n"+'\n'.join(fit_lines))
@@ -1380,6 +1380,8 @@ if st.session_state.df is not None:
                 elif 'Ordered' in model_sel:
                     td=sub[[y_col]+Xv0].dropna(); Xd=td[Xv0]; y_d=td[y_col].astype(int)
                     dist='probit' if 'Probit' in model_sel else 'logit'
+                    stcmd='oprobit' if 'Probit' in model_sel else 'ologit'
+                    do=f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* {model_line}\n\nuse \"data.dta\", clear\n{stcmd} {y_col} {cx} {' '.join(ctrls)}, robust\nmargins, dydx(*) post\n"
                     try:
                         om=OrderedModel(y_d,Xd,distr=dist).fit(disp=0)
                         rows=[]
@@ -1389,15 +1391,18 @@ if st.session_state.df is not None:
                             rows.append({'变量':vn,'系数':f"{b:.4f}{s}",'SE':f"({se:.4f})",'z':f"{t:.2f}"})
                         st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
                         st.caption(f"N={len(td)}｜Pseudo R²={om.prsquared:.4f}｜LL={om.llf:.2f}")
-                        stcmd='oprobit' if 'Probit' in model_sel else 'ologit'
-                        do=f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* {model_line}\n\nuse \"data.dta\", clear\n{stcmd} {y_col} {cx} {' '.join(ctrls)}, robust\nmargins, dydx(*) post\n"
-                        with st.expander("Stata 复现代码"): st.code(do,language='stata')
                     except Exception as e: st.error(f"Ordered 失败：{e}")
+                    with st.expander("Stata 复现代码"): st.code(do,language='stata')
 
                 elif 'Poisson' in model_sel or '负二项' in model_sel:
                     td=sub[[y_col]+Xv0].dropna(); Xd=sm.add_constant(td[Xv0]); y_d=td[y_col]
                     fam=Poisson() if 'Poisson' in model_sel else NegativeBinomial()
                     cov_t='HC0' if use_rob else 'nonrobust'
+                    stcmd='poisson' if 'Poisson' in model_sel else 'nbreg'
+                    if use_cl and cluster_col: stata_se=f', vce(cluster {cluster_col})'
+                    elif use_rob: stata_se=', robust'
+                    else: stata_se=''
+                    do=f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* {model_line}\n\nuse \"data.dta\", clear\n{stcmd} {y_col} {cx} {' '.join(ctrls)}{stata_se}\nmargins, dydx(*) post\n"
                     try:
                         gm=GLM(y_d,Xd,family=fam).fit(cov_type=cov_t)
                         rows=[]
@@ -1408,18 +1413,15 @@ if st.session_state.df is not None:
                         st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
                         se_label='聚类稳健SE' if use_cl else ('异方差稳健SE' if use_rob else '普通SE')
                         st.caption(f"N={len(td)}｜Pseudo R²={1-gm.llf/gm.llnull:.4f}｜LL={gm.llf:.2f}｜SE: {se_label}")
-                        stcmd='poisson' if 'Poisson' in model_sel else 'nbreg'
-                        if use_cl and cluster_col: stata_se=f', vce(cluster {cluster_col})'
-                        elif use_rob: stata_se=', robust'
-                        else: stata_se=''
-                        do=f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* {model_line}\n\nuse \"data.dta\", clear\n{stcmd} {y_col} {cx} {' '.join(ctrls)}{stata_se}\nmargins, dydx(*) post\n"
-                        with st.expander("Stata 复现代码"): st.code(do,language='stata')
                     except Exception as e: st.error(f"计数模型失败：{e}")
+                    with st.expander("Stata 复现代码"): st.code(do,language='stata')
 
                 elif 'Tobit' in model_sel:
                     td=sub[[y_col]+Xv0].dropna(); Xd=sm.add_constant(td[Xv0]).values; y_d=td[y_col].values
                     left_val=td[y_col].min() if (td[y_col]==td[y_col].min()).mean()>0.05 else None
                     tr=tobit_mle(y_d,Xd,left=left_val)
+                    ll_opt=f"ll({left_val})" if left_val else ""
+                    do=f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* {model_line}\n\nuse \"data.dta\", clear\ntobit {y_col} {cx} {' '.join(ctrls)}, {ll_opt} vce(robust)\nmargins, dydx(*) predict(ystar(0,.)) post\n"
                     if tr['converged']:
                         rows=[]
                         for j,vn in enumerate(['const']+Xv0):
@@ -1428,10 +1430,8 @@ if st.session_state.df is not None:
                             rows.append({'变量':vn,'系数':f"{b:.4f}{s}",'SE':f"({se:.4f})"})
                         st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
                         st.caption(f"Tobit MLE｜N={len(td)}｜σ={tr['sigma']:.4f}｜LL={tr['llf']:.2f}")
-                        ll_opt=f"ll({left_val})" if left_val else ""
-                        do=f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* {model_line}\n\nuse \"data.dta\", clear\ntobit {y_col} {cx} {' '.join(ctrls)}, {ll_opt} vce(robust)\nmargins, dydx(*) predict(ystar(0,.)) post\n"
-                        with st.expander("Stata 复现代码"): st.code(do,language='stata')
                     else: st.error(f"Tobit 未收敛：{tr.get('error','')}")
+                    with st.expander("Stata 复现代码"): st.code(do,language='stata')
 
                 elif 'Heckman' in model_sel:
                     if not heckman_sel: st.error("需要指定选择变量")
@@ -1444,6 +1444,7 @@ if st.session_state.df is not None:
                         # exclusion variables: pick variables in ctrl_pool not in current Xv0
                         excl_candidates=[c for c in ctrl_pool if c not in Xv0][:3]
                         Z_vars=np.column_stack([X_h,td[excl_candidates].values]) if excl_candidates else X_h
+                        do=f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* {model_line}\n\nuse \"data.dta\", clear\nheckman {y_col} {cx} {' '.join(ctrls)}, select({heckman_sel}={cx} {' '.join(ctrls)}) twostep\n"
                         try:
                             hr=heckman_two_step(y_h,X_h,Z_vars)
                             rows=[]
@@ -1453,27 +1454,27 @@ if st.session_state.df is not None:
                                 rows.append({'变量':vn,'系数':f"{b:.4f}{s}",'SE':f"({se:.4f})"})
                             st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
                             st.caption(f"Heckman 两步法｜观测={hr['n_obs']}/{hr['n_total']}｜逆Mills比={hr['imr_coef']:.4f}(p={hr['imr_p']:.4f})｜{'选择偏差显著' if hr['imr_p']<0.05 else '选择偏差不显著'}")
-                            do=f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* {model_line}\n\nuse \"data.dta\", clear\nheckman {y_col} {cx} {' '.join(ctrls)}, select({heckman_sel}={cx} {' '.join(ctrls)}) twostep\n"
-                            with st.expander("Stata 复现代码"): st.code(do,language='stata')
                         except Exception as e: st.error(f"Heckman 失败：{e}")
+                        with st.expander("Stata 复现代码"): st.code(do,language='stata')
 
                 elif 'PSM' in model_sel:
                     if not did_var: st.error("需要处理变量")
                     else:
                         td=sub[[y_col,did_var]+Xv0].dropna()
                         D=td[did_var].values; y_p=td[y_col].values; X_p=td[Xv0].values
+                        do=f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* PSM: {model_line}\n\nuse \"data.dta\", clear\npsmatch2 {did_var} {cx} {' '.join(ctrls)}, outcome({y_col}) logit ate att\npstest, both graph\n"
                         try:
                             pr=psm_att(y_p,D,X_p,method='nearest',k=1)
                             st.success(f"PSM ATT = {pr['ATT']:.4f}（{pr['method']} matching, {pr['n_treated']} treated, {pr['n_control']} control）")
-                            do=f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* PSM: {model_line}\n\nuse \"data.dta\", clear\npsmatch2 {did_var} {cx} {' '.join(ctrls)}, outcome({y_col}) logit ate att\npstest, both graph\n"
-                            with st.expander("Stata 复现代码"): st.code(do,language='stata')
                         except Exception as e: st.error(f"PSM 失败：{e}")
+                        with st.expander("Stata 复现代码"): st.code(do,language='stata')
 
                 elif 'IV' in model_sel:
                     if not iv_endog or len(iv_insts)<1: st.error("需要指定内生变量和工具变量")
                     else:
                         exog_vars=[v for v in Xv0 if v!=iv_endog]
                         td=sub[[y_col,iv_endog]+exog_vars+iv_insts].dropna()
+                        do=f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* IV/2SLS: {model_line}\n\nuse \"data.dta\", clear\nivregress 2sls {y_col} {' '.join(exog_vars)} ({iv_endog}={' '.join(iv_insts)}), robust\nestat firststage\nestat overid\n"
                         try:
                             iv_m=IV2SLS(td[y_col],sm.add_constant(td[exog_vars]),td[iv_endog],sm.add_constant(td[iv_insts])).fit()
                             rows=[]
@@ -1484,9 +1485,8 @@ if st.session_state.df is not None:
                                 rows.append({'变量':v,'系数':f"{b:.4f}{s}",'SE':f"({se:.4f})"})
                             st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
                             st.caption(f"IV/2SLS ｜N={len(td)}｜第一阶段F={iv_m.first_stage.diagnostics.get('f_stat',np.nan):.2f}")
-                            do=f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* IV/2SLS: {model_line}\n\nuse \"data.dta\", clear\nivregress 2sls {y_col} {' '.join(exog_vars)} ({iv_endog}={' '.join(iv_insts)}), robust\nestat firststage\nestat overid\n"
-                            with st.expander("Stata 复现代码"): st.code(do,language='stata')
                         except Exception as e: st.error(f"IV 失败：{e}")
+                        with st.expander("Stata 复现代码"): st.code(do,language='stata')
 
                 # ═══ ANOVA/组间比较 ═══
                 elif 'ANOVA' in model_sel:
