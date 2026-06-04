@@ -530,7 +530,8 @@ def refit_baseline(y_col, focus_cx, Xv0, data, model_sel, is_panel, use_rob=Fals
             y_h=td[y_col].values
             Z_vars=td[Xv].values
             hr=heckman_two_step(y_h,X_h,Z_vars)
-            b=hr['params'].get(focus_cx,np.nan); se=hr['se'].get(focus_cx,np.nan)
+            pi=Xv.index(focus_cx)+1 if focus_cx in Xv else -1  # +1 skip const
+            b=float(hr['params'][pi]) if pi>=0 else np.nan; se=float(hr['se'][pi]) if pi>=0 else np.nan
             t=abs(b/se) if se>0 else 0
             return {'success':True,'coef':float(b),'se':float(se),'tstat':float(t),
                 'pval':float(2*(1-stats.t.cdf(t,df=max(n-len(Xv)-1,1)))),
@@ -1449,7 +1450,7 @@ if st.session_state.df is not None:
                             hr=heckman_two_step(y_h,X_h,Z_vars)
                             rows=[]
                             for j,vn in enumerate(Xv0):
-                                b=hr['params'][j]; se=hr['se'][j]; t=abs(b/se) if se>0 else 0; pv=2*(1-stats.t.cdf(t,df=hr['n_obs']))
+                                b=hr['params'][j+1]; se=hr['se'][j+1]; t=abs(b/se) if se>0 else 0; pv=2*(1-stats.t.cdf(t,df=hr['n_obs']))
                                 s='***' if pv<0.01 else ('**' if pv<0.05 else ('*' if pv<0.1 else ''))
                                 rows.append({'变量':vn,'系数':f"{b:.4f}{s}",'SE':f"({se:.4f})"})
                             st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
