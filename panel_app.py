@@ -15,7 +15,7 @@ from scipy import stats
 from scipy.optimize import minimize
 from itertools import combinations
 from sklearn.neighbors import NearestNeighbors
-import time, warnings
+import time, warnings, traceback
 warnings.filterwarnings('ignore')
 
 st.set_page_config(page_title="鹈鹕回归", layout="wide")
@@ -1347,7 +1347,7 @@ if st.session_state.df is not None:
                                 s='***' if pv<0.01 else ('**' if pv<0.05 else ('*' if pv<0.1 else ''))
                                 rows.append({'变量':vn,'Logit 系数':f"{b:.4f}{s}",'Logit SE':f"({se:.4f})"})
                             fit_lines.append(f"Logit: Pseudo R²={lf.prsquared:.4f}, LL={lf.llf:.2f}")
-                        except Exception as e: st.error(f"Logit 拟合失败：{e}")
+                        except Exception as e: st.error(f"Logit 拟合失败：{e} ({type(e).__name__})")
                     if run_pr:
                         do+=f"probit {y_col} {cx} {' '.join(ctrls)}{stata_se}\n"
                         try:
@@ -1360,7 +1360,7 @@ if st.session_state.df is not None:
                                         if rr['变量']==vn: rr['Probit 系数']=f"{b:.4f}{s}"; rr['Probit SE']=f"({se:.4f})"
                                 else: rows.append({'变量':vn,'Probit 系数':f"{b:.4f}{s}",'Probit SE':f"({se:.4f})"})
                             fit_lines.append(f"Probit: Pseudo R²={pf.prsquared:.4f}, LL={pf.llf:.2f}")
-                        except Exception as e: st.error(f"Probit 拟合失败：{e}")
+                        except Exception as e: st.error(f"Probit 拟合失败：{e}\n\n```\n{traceback.format_exc()}\n```\nstatsmodels 版本: {sm.__version__}")
                     if run_lpm:
                         do+=f"reg {y_col} {cx} {' '.join(ctrls)}{stata_se}\n"
                         lm=OLS(y_d,Xd).fit(cov_type='HC1')
