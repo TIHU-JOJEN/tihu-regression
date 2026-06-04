@@ -76,12 +76,19 @@ def tobit_mle(y, X, left=None, right=None):
         beta=res.x[:k]; sigma=np.exp(res.x[k])
         se=np.full(k,np.nan)
         try:
-            eps=1e-5; H=np.zeros((k+1,k+1))
+            eps=1e-5; H=np.zeros((k+1,k+1)); nll0=nll(res.x)
             for ii in range(k+1):
                 for jj in range(ii,k+1):
-                    xp=res.x.copy(); xp[ii]+=eps; xp[jj]+=eps
-                    xm=res.x.copy(); xm[ii]-=eps; xm[jj]-=eps
-                    H[ii,jj]=(nll(xp)-nll(xm))/(2*eps) if ii==jj else (nll(xp)-nll(xm))/(4*eps*eps)
+                    if ii==jj:
+                        xp=res.x.copy(); xp[ii]+=eps
+                        xm=res.x.copy(); xm[ii]-=eps
+                        H[ii,jj]=(nll(xp)-2*nll0+nll(xm))/(eps*eps)
+                    else:
+                        xpp=res.x.copy(); xpp[ii]+=eps; xpp[jj]+=eps
+                        xpm=res.x.copy(); xpm[ii]+=eps; xpm[jj]-=eps
+                        xmp=res.x.copy(); xmp[ii]-=eps; xmp[jj]+=eps
+                        xmm=res.x.copy(); xmm[ii]-=eps; xmm[jj]-=eps
+                        H[ii,jj]=(nll(xpp)-nll(xpm)-nll(xmp)+nll(xmm))/(4*eps*eps)
                     H[jj,ii]=H[ii,jj]
             cov=np.linalg.pinv(H); se=np.sqrt(np.diag(cov))[:k]
         except: pass
@@ -519,9 +526,9 @@ def refit_baseline(y_col, focus_cx, Xv0, data, model_sel, is_panel, use_rob=Fals
             n=len(td)
             if n<30: return {'success':False,'error':'样本量<30','n':n}
             Xv=[v for v in Xv0 if v in td.columns]
-            X_h=sm.add_constant(td[Xv])
+            X_h=td[Xv].values
             y_h=td[y_col].values
-            Z_vars=sm.add_constant(td[Xv])
+            Z_vars=td[Xv].values
             hr=heckman_two_step(y_h,X_h,Z_vars)
             b=hr['params'].get(focus_cx,np.nan); se=hr['se'].get(focus_cx,np.nan)
             t=abs(b/se) if se>0 else 0
@@ -848,7 +855,7 @@ if st.session_state.df is not None:
                         try:
                             Xv=[cx]+list(combo); td=sub[[y_col]+Xv].dropna()
                             if len(td)<30: continue
-                            m=OLS(td[y_col].values,sm.add_constant(td[Xv].values)).fit()
+                            m=OLS(td[y_col],sm.add_constant(td[Xv])).fit()
                             b=m.params.iloc[1]; se=m.bse.iloc[1]; ts=b/se if se>0 else 0
                             ols_p={}; pidx=list(m.params.index)
                             for jj in range(min(len(pidx),len(['const']+Xv))):
@@ -876,7 +883,7 @@ if st.session_state.df is not None:
                         try:
                             Xv=cx_list+list(combo); td=sub[[y_col]+Xv].dropna()
                             if len(td)<30: continue
-                            m=OLS(td[y_col].values,sm.add_constant(td[Xv].values)).fit()
+                            m=OLS(td[y_col],sm.add_constant(td[Xv])).fit()
                             ols_p={}; tstats={}; pidx=list(m.params.index)
                             for jj in range(min(len(pidx),len(['const']+Xv))):
                                 ols_p[pidx[jj]]={'b':float(m.params.iloc[jj]),'se':float(m.bse.iloc[jj])}
@@ -1141,6 +1148,7 @@ if st.session_state.df is not None:
                 st.session_state._group_var=group_var
                 st.session_state._df_aug=df_aug
                 st.session_state._cat_cols=cat_cols
+                st.session_state._dummy_names=dummy_names
                 st.session_state._med_results=med_results; st.session_state._mod_results=mod_results
                 st.session_state._med_m=med_m; st.session_state._mod_m=mod_m
                 st.session_state._add_med=add_med; st.session_state._add_mod=add_mod
@@ -1588,7 +1596,8 @@ if st.session_state.df is not None:
                         st.caption(f"分组面板回归：按 {group_var} 分 {len(groups)} 组分别估计 FE+RE")
                         do=f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* 分组面板回归: by {group_var}\n\nuse \"data.dta\", clear\nxtset {id_col} {tc_col}\n"
                         for grp in groups:
-                            do+=f"\n* 分组: {group_var}={grp}\nreghdfe {y_col} {cx} {' '.join(ctrls)} if {group_var}=={grp}, absorb({id_col} {tc_col})\n"
+                            grp_stata = f'"{grp}"' if isinstance(grp, str) else str(grp)
+                            do+=f"\n* 分组: {group_var}={grp}\nreghdfe {y_col} {cx} {' '.join(ctrls)} if {group_var}=={grp_stata}, absorb({id_col} {tc_col})\n"
                         with st.expander("Stata 复现代码"): st.code(do,language='stata')
 
 
@@ -1757,7 +1766,7 @@ if st.session_state.df is not None:
                             id_col=st.session_state._id_col; tc_col=st.session_state._tc_col
                             if id_col not in excl_het: excl_het.append(id_col)
                             if tc_col not in excl_het: excl_het.append(tc_col)
-                        het_candidates=[c for c in df_aug.columns if c not in excl_het]
+                        het_candidates=[c for c in df_aug.columns if c not in excl_het and c not in st.session_state.get('_dummy_names',[])]
                         het_var=st.selectbox("分组变量",het_candidates,key=f'het_gvar_{cx}')
                         if het_var:
                             het_series=df_aug[het_var].dropna()
@@ -1834,8 +1843,8 @@ if st.session_state.df is not None:
                         num_cols=[c for c in df_aug.columns if pd.api.types.is_numeric_dtype(df_aug[c]) and c!=y_col]
                         drop_col=st.selectbox("剔除依据变量",num_cols,key=f'rob_dropcol_{cx}') if num_cols else None
                         dc1,dc2=st.columns(2)
-                        with dc1: dmin=st.number_input("保留 ≥",value=float(df_aug[drop_col].min()) if drop_col else 0.0,key=f'rob_dmin_{cx}')
-                        with dc2: dmax=st.number_input("保留 ≤",value=float(df_aug[drop_col].max()) if drop_col else 100.0,key=f'rob_dmax_{cx}')
+                        with dc1: dmin=st.number_input("保留 ≥",value=float(df_aug[drop_col].min()) if drop_col else 0.0,key=f'rob_dmin_{cx}_{drop_col}')
+                        with dc2: dmax=st.number_input("保留 ≤",value=float(df_aug[drop_col].max()) if drop_col else 100.0,key=f'rob_dmax_{cx}_{drop_col}')
                         use_drop=st.checkbox("启用样本剔除",key=f'rob_drop_en_{cx}') if drop_col else False
                         st.info("更换X/Y变量、增删控制变量等请返回 Step 3 重新搜索基准回归")
                         if st.button("运行稳健性检验",key=f'run_rob_{cx}'):
