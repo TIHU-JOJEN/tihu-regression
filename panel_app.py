@@ -22,7 +22,7 @@ st.set_page_config(page_title="鹈鹕回归", layout="wide")
 
 for k, v in [('df',None),('df_name',None),('data_type',None),('diagnosed',False),
              ('id_col',None),('time_col',None),('balanced',None),('n_units',0),('n_periods',0),
-             ('search_results',None)]:
+             ('search_results',None),('raw_df',None),('cleaning_log',[])]:
     if k not in st.session_state: st.session_state[k] = v
 
 # ── 免责声明模板（统一注入 Stata 代码头部） ──
@@ -268,7 +268,7 @@ def run_moderation_analysis(y_col, x, m, controls, df):
 
 def refit_baseline(y_col, focus_cx, Xv0, data, model_sel, is_panel, use_rob=False,
                    id_col=None, tc_col=None, did_var=None, iv_endog=None, iv_insts=None,
-                   heckman_sel=None):
+                   heckman_sel=None, did_policy_time=None, did_post_var=None):
     """在数据子集上重新拟合基准模型。返回 {success,coef,se,tstat,pval,n,rsq,error}"""
     try:
         n_raw=len(data)
@@ -324,7 +324,7 @@ def refit_baseline(y_col, focus_cx, Xv0, data, model_sel, is_panel, use_rob=Fals
                 'n':n,'rsq':float(fe_r.rsquared)}
 
         # ── OLS / Pooled OLS ──
-        if model_sel.startswith('OLS') or 'Pooled' in model_sel:
+        if model_sel.startswith('OLS') or 'Pooled' in model_sel or 'RDD' in model_sel:
             need=[y_col]+[v for v in Xv0 if v in data.columns]
             td=data[need].dropna()
             n=len(td)
@@ -428,12 +428,17 @@ def refit_baseline(y_col, focus_cx, Xv0, data, model_sel, is_panel, use_rob=Fals
                 return {'success':False,'error':'DID 需要面板数据','n':n_raw}
             if did_var is None: return {'success':False,'error':'DID 需要处理变量','n':n_raw}
             need=[y_col]+[v for v in Xv0 if v in data.columns]+[id_col,tc_col,did_var]
+            if did_post_var and did_post_var in data.columns and did_post_var not in need:
+                need.append(did_post_var)
             td=data[need].dropna().copy()
             td[id_col]=td[id_col].astype(str)
             td[tc_col]=pd.to_numeric(td[tc_col],errors='coerce')
             td=td.dropna(subset=[tc_col])
-            t_med=td[tc_col].median()
-            td['_post']=(td[tc_col]>=t_med).astype(float)
+            if did_post_var and did_post_var in td.columns:
+                td['_post']=td[did_post_var].astype(float)
+            else:
+                cutoff = did_policy_time if did_policy_time is not None else td[tc_col].median()
+                td['_post']=(td[tc_col]>=cutoff).astype(float)
             td['_treat']=td[did_var].astype(float)
             td['_did']=td['_treat']*td['_post']
             td=td.set_index([id_col,tc_col])
@@ -455,12 +460,17 @@ def refit_baseline(y_col, focus_cx, Xv0, data, model_sel, is_panel, use_rob=Fals
                 return {'success':False,'error':'PSM-DID 需要面板数据','n':n_raw}
             if did_var is None: return {'success':False,'error':'PSM-DID 需要处理变量','n':n_raw}
             need=[y_col]+[v for v in Xv0 if v in data.columns]+[id_col,tc_col,did_var]
+            if did_post_var and did_post_var in data.columns and did_post_var not in need:
+                need.append(did_post_var)
             td=data[need].dropna().copy()
             td[id_col]=td[id_col].astype(str)
             td[tc_col]=pd.to_numeric(td[tc_col],errors='coerce')
             td=td.dropna(subset=[tc_col])
-            t_med=td[tc_col].median()
-            td['_post']=(td[tc_col]>=t_med).astype(float)
+            if did_post_var and did_post_var in td.columns:
+                td['_post']=td[did_post_var].astype(float)
+            else:
+                cutoff = did_policy_time if did_policy_time is not None else td[tc_col].median()
+                td['_post']=(td[tc_col]>=cutoff).astype(float)
             td['_treat']=td[did_var].astype(float)
             td['_did']=td['_treat']*td['_post']
             # PSM matching on pre-treatment covariates
@@ -549,18 +559,99 @@ uploaded = st.file_uploader("拖拽 .dta / .csv / .xlsx", type=['dta','csv','xls
 if uploaded is not None:
     if st.session_state.df_name != uploaded.name:
         try:
-            if uploaded.name.endswith('.dta'): st.session_state.df=pd.read_stata(uploaded)
-            elif uploaded.name.endswith('.csv'): st.session_state.df=pd.read_csv(uploaded)
-            else: st.session_state.df=pd.read_excel(uploaded)
+            if uploaded.name.endswith('.dta'): raw_df=pd.read_stata(uploaded)
+            elif uploaded.name.endswith('.csv'): raw_df=pd.read_csv(uploaded)
+            else: raw_df=pd.read_excel(uploaded)
+            st.session_state.raw_df=raw_df.copy()
+            st.session_state.df=raw_df.copy()
             st.session_state.df_name=uploaded.name; st.session_state.data_type=None
             st.session_state.diagnosed=False; st.session_state.search_results=None
             st.session_state.id_col=None; st.session_state.time_col=None
+            st.session_state.cleaning_log=[]
         except Exception as e: st.error(f"读取失败：{e}"); st.stop()
 
 if st.session_state.df is not None:
     df=st.session_state.df
     st.success(f"当前：{st.session_state.df_name} ｜ {df.shape[0]}行 × {df.shape[1]}列")
     with st.expander("预览"): st.dataframe(df.head(6),use_container_width=True)
+
+
+    # ═══════════════════ STEP 1.5: 数据清洗（可选） ═══════════════════
+    st.header("Step 1.5 · 数据清洗（可选）")
+    st.caption("先清洗，再进入实证。默认不处理；用户明确选择后才应用。")
+    if st.session_state.raw_df is None:
+        st.session_state.raw_df=df.copy()
+    with st.expander("打开数据清洗面板", expanded=False):
+        raw_df=st.session_state.raw_df.copy()
+        clean_cols=raw_df.columns.tolist()
+        miss_total=int(raw_df.isna().sum().sum())
+        dup_total=int(raw_df.duplicated().sum())
+        st.caption(f"原始数据：{raw_df.shape[0]}行 × {raw_df.shape[1]}列 ｜ 缺失值 {miss_total} 个 ｜ 完全重复行 {dup_total} 行")
+        selected_clean_cols=st.multiselect("参与清洗的列", clean_cols, default=clean_cols, key='clean_cols_v1')
+        miss_method=st.radio("缺失值处理", ['不处理缺失值','删除所选列含缺失的行','数值列均值插补','数值列中位数插补','线性插值（按当前排序）'], horizontal=False, key='miss_method_v1')
+        c_clean1,c_clean2=st.columns(2)
+        with c_clean1:
+            drop_dups=st.checkbox("删除完全重复行", key='drop_dups_v1')
+        with c_clean2:
+            convert_numeric=st.checkbox("尝试把数字文本转为数值", value=True, key='convert_numeric_v1')
+        num_for_winsor=[c for c in clean_cols if pd.api.types.is_numeric_dtype(raw_df[c])]
+        winsor_method=st.radio("极端值处理", ['不缩尾','1%/99%缩尾','5%/95%缩尾'], horizontal=True, key='winsor_method_v1')
+        winsor_cols=st.multiselect("缩尾变量", num_for_winsor, default=[], key='winsor_cols_v1') if winsor_method!='不缩尾' else []
+        ac1,ac2=st.columns(2)
+        with ac1:
+            apply_clean=st.button("应用清洗", type='primary', key='apply_clean_v1')
+        with ac2:
+            reset_clean=st.button("恢复原始数据", key='reset_clean_v1')
+        if apply_clean:
+            work=raw_df.copy(); logs=[]
+            before_shape=work.shape
+            if convert_numeric:
+                converted=[]
+                for c in selected_clean_cols:
+                    if c in work.columns and work[c].dtype=='object':
+                        new_col=pd.to_numeric(work[c], errors='ignore')
+                        if str(new_col.dtype)!=str(work[c].dtype):
+                            work[c]=new_col; converted.append(c)
+                if converted: logs.append('数字文本转数值：'+', '.join(converted[:8])+(' 等' if len(converted)>8 else ''))
+            if drop_dups:
+                n0=len(work); work=work.drop_duplicates(); logs.append(f'删除完全重复行 {n0-len(work)} 行')
+            if selected_clean_cols:
+                if miss_method=='删除所选列含缺失的行':
+                    n0=len(work); work=work.dropna(subset=[c for c in selected_clean_cols if c in work.columns]); logs.append(f'删除缺失行 {n0-len(work)} 行')
+                elif miss_method in ['数值列均值插补','数值列中位数插补']:
+                    method='均值' if '均值' in miss_method else '中位数'
+                    filled=[]
+                    for c in selected_clean_cols:
+                        if c in work.columns and pd.api.types.is_numeric_dtype(work[c]) and work[c].isna().any():
+                            val=work[c].mean() if method=='均值' else work[c].median()
+                            work[c]=work[c].fillna(val); filled.append(c)
+                    if filled: logs.append(f'{method}插补：'+', '.join(filled[:8])+(' 等' if len(filled)>8 else ''))
+                elif miss_method=='线性插值（按当前排序）':
+                    filled=[]
+                    for c in selected_clean_cols:
+                        if c in work.columns and pd.api.types.is_numeric_dtype(work[c]) and work[c].isna().any():
+                            work[c]=work[c].interpolate(limit_direction='both'); filled.append(c)
+                    if filled: logs.append('线性插值：'+', '.join(filled[:8])+(' 等' if len(filled)>8 else ''))
+            if winsor_method!='不缩尾' and winsor_cols:
+                pct=0.01 if winsor_method.startswith('1%') else 0.05
+                done=[]
+                for c in winsor_cols:
+                    if c in work.columns and pd.api.types.is_numeric_dtype(work[c]):
+                        lo,hi=work[c].quantile(pct),work[c].quantile(1-pct)
+                        work[c]=work[c].clip(lo,hi); done.append(c)
+                if done: logs.append(f'{winsor_method}：'+', '.join(done[:8])+(' 等' if len(done)>8 else ''))
+            st.session_state.df=work
+            st.session_state.diagnosed=False; st.session_state.search_results=None
+            st.session_state.cleaning_log=logs if logs else ['未执行实际清洗操作']
+            st.success(f"清洗完成：{before_shape[0]}行 × {before_shape[1]}列 → {work.shape[0]}行 × {work.shape[1]}列")
+        if reset_clean:
+            st.session_state.df=raw_df.copy()
+            st.session_state.diagnosed=False; st.session_state.search_results=None
+            st.session_state.cleaning_log=[]
+            st.success("已恢复为上传时的原始数据")
+        if st.session_state.cleaning_log:
+            st.info('当前清洗记录：'+'；'.join(st.session_state.cleaning_log))
+    df=st.session_state.df
 
     # ═══════════════════ STEP 2: 数据结构 ═══════════════════
     st.header("Step 2 · 数据结构诊断")
@@ -711,7 +802,7 @@ if st.session_state.df is not None:
             elif y_type=='ordered': model_options=['Ordered Logit','Ordered Probit']
             elif y_type=='count': model_options=['Poisson','负二项（Negative Binomial）']
             elif y_type=='censored': model_options=['OLS+稳健SE','Tobit（截断回归）']
-            else: model_options=['OLS','OLS+稳健SE','Tobit（如被截断）','Heckman（样本选择）']
+            else: model_options=['OLS','OLS+稳健SE','Tobit（如被截断）','Heckman（样本选择）','RDD（断点回归）']
             model_options.append('PSM（倾向得分匹配）')
             model_options.append('IV/2SLS（工具变量）')
             if cat_cols:
@@ -731,12 +822,37 @@ if st.session_state.df is not None:
 
         # 核心X + 控制变量（含虚拟变量）
         rem=[c for c in all_vars if c!=y_col]
-        core_x=st.multiselect("核心 X（最多 8 个）",rem,default=rem[:1] if rem else [],max_selections=8,key='cx7')
-        pool_opt=[c for c in rem if c not in core_x]
+        fixed_controls=[]; rdd_running=None; rdd_cutoff=None; rdd_bandwidth=0.0; rdd_order='局部线性（一阶）'
+        if 'RDD' in sel_model:
+            rdd_candidates=[c for c in all_num if c not in excl and c!=y_col]
+            rdd_running=st.selectbox("断点变量 / Running variable", rdd_candidates, key='rdd_run_v1') if rdd_candidates else None
+            if not rdd_running:
+                st.warning("RDD 需要至少一个数值型断点变量"); st.stop()
+            rv=df_aug[rdd_running].dropna()
+            default_cut=float(rv.median()) if len(rv) else 0.0
+            c_rdd1,c_rdd2,c_rdd3=st.columns(3)
+            with c_rdd1: rdd_cutoff=st.number_input("断点值 cutoff", value=default_cut, key='rdd_cut_v1')
+            with c_rdd2: rdd_bandwidth=st.number_input("带宽（0=不限制）", min_value=0.0, value=0.0, key='rdd_bw_v1')
+            with c_rdd3: rdd_order=st.radio("阶数", ['局部线性（一阶）','二阶多项式'], horizontal=False, key='rdd_order_v1')
+            df_aug['_rdd_treat']=(df_aug[rdd_running]>=rdd_cutoff).astype(float)
+            df_aug['_rdd_running_c']=df_aug[rdd_running]-rdd_cutoff
+            df_aug['_rdd_inter']=df_aug['_rdd_treat']*df_aug['_rdd_running_c']
+            fixed_controls=['_rdd_running_c','_rdd_inter']
+            if '二阶' in rdd_order:
+                df_aug['_rdd_running_c2']=df_aug['_rdd_running_c']**2
+                df_aug['_rdd_inter2']=df_aug['_rdd_treat']*df_aug['_rdd_running_c2']
+                fixed_controls+=['_rdd_running_c2','_rdd_inter2']
+            core_x=['_rdd_treat']
+            pool_opt=[c for c in rem if c!=rdd_running]
+            st.caption("RDD 将自动生成断点处理项，并固定控制 running variable、断点两侧斜率项；候选控制变量仍由用户选择。")
+        else:
+            core_x=st.multiselect("核心 X（最多 8 个）",rem,default=rem[:1] if rem else [],max_selections=8,key='cx7')
+            pool_opt=[c for c in rem if c not in core_x]
         ctrl_pool=st.multiselect(f"控制变量候选池（最多 20，可选 {len(pool_opt)} 个）",pool_opt,
             default=pool_opt[:min(10,len(pool_opt))],max_selections=20,key='pool7')
         c3,c4=st.columns(2)
-        with c3: cmin=st.number_input("最少控制数",0,15,2,key='cmin7')
+        default_cmin=0 if 'RDD' in sel_model else 2
+        with c3: cmin=st.number_input("最少控制数",0,15,default_cmin,key='cmin7')
         with c4: cmax=st.number_input("最多控制数",1,15,min(5,len(ctrl_pool) if ctrl_pool else 5),key='cmax7')
         if cmax<cmin: cmax=cmin
 
@@ -748,13 +864,23 @@ if st.session_state.df is not None:
         use_cl=False; cluster_col=None; use_rob=False; se_mode='ordinary'
         bin_m=None; did_var=None; heckman_sel=None
         iv_endog=None; iv_insts=[]
+        did_policy_time=None; did_post_var=None; did_post_mode='按政策时间生成 Post'
         if dt=='panel':
-            if 'DID' in sel_model and 'PSM' not in sel_model:
-                did_var=st.selectbox("处理变量（二分，1=处理组）",bin_vars,key='did7')
-                st.caption("模型将自动创建 Post×Treat 交互项")
-            if 'PSM-DID' in sel_model:
-                did_var=st.selectbox("处理变量",bin_vars,key='psmdid7')
-                st.caption("PSM-DID：先匹配再双重差分")
+            if 'DID' in sel_model:
+                did_var=st.selectbox("处理组变量（二分，1=处理组）",bin_vars,key='did7')
+                did_post_mode=st.radio("Post 变量来源", ['按政策时间生成 Post','使用已有 Post 变量'], horizontal=True, key='did_post_mode_v1')
+                if did_post_mode.startswith('按政策'):
+                    time_vals=sorted(pd.Series(df[tc]).dropna().unique().tolist())
+                    default_idx=len(time_vals)//2 if time_vals else 0
+                    did_policy_time=st.selectbox("政策发生时间（该时间及以后 Post=1）", time_vals, index=default_idx, key='did_policy_time_v1') if time_vals else None
+                    st.caption(f"DID：Treat={did_var}，Post=({tc} >= {did_policy_time})，交互项 Treat×Post")
+                else:
+                    post_candidates=[c for c in bin_vars if c!=did_var]
+                    did_post_var=st.selectbox("已有 Post 变量（二分，1=政策后）", post_candidates, key='did_post_var_v1') if post_candidates else None
+                    if did_post_var is None: st.warning("没有可用的二分 Post 变量，请改用政策时间生成 Post")
+                    st.caption(f"DID：Treat={did_var}，Post={did_post_var}，交互项 Treat×Post")
+                if 'PSM-DID' in sel_model:
+                    st.caption("PSM-DID：先匹配再双重差分")
         else:
             if 'PSM' in sel_model:
                 did_var=st.selectbox("处理变量（二分）",[c for c in rem if len(df_aug[c].dropna().unique())==2],key='psm_t7')
@@ -819,7 +945,7 @@ if st.session_state.df is not None:
             st.info("中介/调节效应建议使用「分别显著」模式，将对每个核心X单独分析")
         if st.button(btn_label,type="primary",key='srch7'):
             if not core_x: st.warning("请选核心 X")
-            elif not ctrl_pool or len(ctrl_pool)<2: st.warning("候选池需 ≥2 个变量")
+            elif 'RDD' not in sel_model and (not ctrl_pool or len(ctrl_pool)<2): st.warning("候选池需 ≥2 个变量")
             elif len(ctrl_pool)<cmin: st.warning("候选池不足最少控制数")
             elif 'IV' in sel_model and len(iv_insts)<1: st.warning("工具变量至少选1个")
             else:
@@ -831,16 +957,20 @@ if st.session_state.df is not None:
                     id_col,tc_col=st.session_state.id_col,st.session_state.time_col
                     if not id_col or not tc_col or id_col not in df_aug.columns or tc_col not in df_aug.columns:
                         st.error("面板 ID/时间列丢失，请返回 Step 2 重新诊断"); st.stop()
-                    use_vars=[id_col,tc_col,y_col]+core_x+ctrl_pool
+                    use_vars=[id_col,tc_col,y_col]+core_x+fixed_controls+ctrl_pool
                     if did_var: use_vars.append(did_var)
+                    if did_post_var and did_post_var not in use_vars: use_vars.append(did_post_var)
                     sub=df_aug[use_vars].dropna().copy()
                     sub[id_col]=sub[id_col].astype(str)
                     if sub.duplicated(subset=[id_col,tc_col]).sum()>0:
                         sub=sub.groupby([id_col,tc_col]).mean().reset_index()
                 else:
-                    use_vars=[y_col]+core_x+ctrl_pool
+                    use_vars=[y_col]+core_x+fixed_controls+ctrl_pool
                     if did_var: use_vars.append(did_var)
+                    if did_post_var and did_post_var not in use_vars: use_vars.append(did_post_var)
                     sub=df_aug[use_vars].dropna().copy()
+                    if 'RDD' in sel_model and rdd_bandwidth and rdd_bandwidth>0:
+                        sub=sub[sub['_rdd_running_c'].abs()<=rdd_bandwidth].copy()
 
                 # ── 通用搜索函数（OLS 快速筛选） ──
                 def search_ols(cx,pool,mn,mx):
@@ -854,14 +984,14 @@ if st.session_state.df is not None:
                     for i,combo in enumerate(ac):
                         if i%1000==0: progress.progress(min(i/n_total,.95),text=f"{cx}: {i}/{n_total}")
                         try:
-                            Xv=[cx]+list(combo); td=sub[[y_col]+Xv].dropna()
+                            Xv=[cx]+fixed_controls+list(combo); td=sub[[y_col]+Xv].dropna()
                             if len(td)<30: continue
                             m=OLS(td[y_col],sm.add_constant(td[Xv])).fit()
                             b=m.params.iloc[1]; se=m.bse.iloc[1]; ts=b/se if se>0 else 0
                             ols_p={}; pidx=list(m.params.index)
                             for jj in range(min(len(pidx),len(['const']+Xv))):
                                 ols_p[pidx[jj]]={'b':float(m.params.iloc[jj]),'se':float(m.bse.iloc[jj])}
-                            res.append(dict(controls=combo,n=len(td),tstat=float(ts),
+                            res.append(dict(controls=tuple(fixed_controls)+tuple(combo),n=len(td),tstat=float(ts),
                                 pval=float(2*(1-stats.t.cdf(abs(ts),df=len(td)-len(Xv)-1))),
                                 rsq=float(m.rsquared),rsq_adj=float(m.rsquared_adj),
                                 ols_params=ols_p))
@@ -882,7 +1012,7 @@ if st.session_state.df is not None:
                     for i,combo in enumerate(ac):
                         if i%1000==0: progress.progress(min(i/n_total,.95),text=f"联合搜索: {i}/{n_total}")
                         try:
-                            Xv=cx_list+list(combo); td=sub[[y_col]+Xv].dropna()
+                            Xv=cx_list+fixed_controls+list(combo); td=sub[[y_col]+Xv].dropna()
                             if len(td)<30: continue
                             m=OLS(td[y_col],sm.add_constant(td[Xv])).fit()
                             ols_p={}; tstats={}; pidx=list(m.params.index)
@@ -895,7 +1025,7 @@ if st.session_state.df is not None:
                                     tstats[cx]=float(b/se) if se>0 else 0
                                 except: tstats[cx]=0
                             min_t=min(abs(t) for t in tstats.values())
-                            res.append(dict(controls=combo,n=len(td),min_abs_tstat=float(min_t),
+                            res.append(dict(controls=tuple(fixed_controls)+tuple(combo),n=len(td),min_abs_tstat=float(min_t),
                                 tstats=tstats,rsq=float(m.rsquared),rsq_adj=float(m.rsquared_adj),
                                 ols_params=ols_p,all_Xv=Xv))
                         except: continue
@@ -1140,6 +1270,8 @@ if st.session_state.df is not None:
                 for kk in ['_did_var','_use_cl','_heckman_sel','_iv_endog','_iv_insts','_id_col','_tc_col','_bin_m']:
                     if kk in st.session_state: del st.session_state[kk]
                 st.session_state._did_var=did_var; st.session_state._use_cl=use_cl
+                st.session_state._did_policy_time=did_policy_time; st.session_state._did_post_var=did_post_var; st.session_state._did_post_mode=did_post_mode
+                st.session_state._rdd_running=rdd_running; st.session_state._rdd_cutoff=rdd_cutoff; st.session_state._rdd_bandwidth=rdd_bandwidth; st.session_state._rdd_order=rdd_order
                 st.session_state._cluster_col=cluster_col
                 st.session_state._se_mode=se_mode; st.session_state._use_rob=use_rob
                 st.session_state._heckman_sel=heckman_sel
@@ -1165,6 +1297,8 @@ if st.session_state.df is not None:
         model_sel=st.session_state._model; yt=st.session_state._y_type
         is_panel=st.session_state._is_panel; sub=st.session_state._sub
         did_var=st.session_state._did_var; use_cl=st.session_state._use_cl
+        did_policy_time=st.session_state.get('_did_policy_time',None); did_post_var=st.session_state.get('_did_post_var',None); did_post_mode=st.session_state.get('_did_post_mode','按政策时间生成 Post')
+        rdd_running=st.session_state.get('_rdd_running',None); rdd_cutoff=st.session_state.get('_rdd_cutoff',None); rdd_bandwidth=st.session_state.get('_rdd_bandwidth',0.0); rdd_order=st.session_state.get('_rdd_order','局部线性（一阶）')
         cluster_col=st.session_state.get('_cluster_col',None)
         se_mode=st.session_state.get('_se_mode','ordinary'); use_rob=st.session_state.get('_use_rob',False)
         heckman_sel=st.session_state._heckman_sel
@@ -1280,11 +1414,20 @@ if st.session_state.df is not None:
                 elif is_panel and 'DID' in model_sel and 'PSM' not in model_sel:
                     # 2×2 DID
                     id_col=st.session_state._id_col; tc_col=st.session_state._tc_col
-                    td=sub[[id_col,tc_col,y_col,did_var]+Xv0].dropna().copy()
+                    did_cols=[id_col,tc_col,y_col,did_var]+Xv0
+                    if did_post_var and did_post_var not in did_cols: did_cols.append(did_post_var)
+                    td=sub[did_cols].dropna().copy()
                     td[id_col]=td[id_col].astype(str)
-                    # 创建 Post: 时间中位数之后为1
-                    t_med=td[tc_col].median()
-                    td['_post']=(td[tc_col]>=t_med).astype(float)
+                    # 创建 Post：由用户选择政策时间或已有 Post 变量
+                    if did_post_var and did_post_var in td.columns:
+                        td['_post']=td[did_post_var].astype(float)
+                        post_note=f"Post 使用已有变量 {did_post_var}"
+                        post_stata=f"gen post={did_post_var}"
+                    else:
+                        cutoff=did_policy_time if did_policy_time is not None else td[tc_col].median()
+                        td['_post']=(td[tc_col]>=cutoff).astype(float)
+                        post_note=f"Post=({tc_col}>={cutoff})"
+                        post_stata=f"gen post=({tc_col}>={cutoff})"
                     td['_treat']=td[did_var]
                     td['_did']=td['_treat']*td['_post']
                     td_idx=td.set_index([id_col,tc_col])
@@ -1292,7 +1435,7 @@ if st.session_state.df is not None:
                     try:
                         d_m=PanelOLS(td_idx[y_col],X_did,entity_effects=True,time_effects=False)
                         d_r=d_m.fit()
-                        st.info(f"DID 估计量（交互项 _did）= {d_r.params.get('_did',np.nan):.4f} (SE={d_r.std_errors.get('_did',np.nan):.4f})")
+                        st.info(f"DID 估计量（交互项 _did）= {d_r.params.get('_did',np.nan):.4f} (SE={d_r.std_errors.get('_did',np.nan):.4f}) ｜ {post_note}")
                         rows=[]
                         for v in Xv0+['_treat','_post','_did']:
                             b=d_r.params.get(v,np.nan); se=d_r.std_errors.get(v,np.nan)
@@ -1301,13 +1444,41 @@ if st.session_state.df is not None:
                             rows.append({'变量':v,'系数':f"{b:.4f}{s}",'SE':f"({se:.4f})"})
                         st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
                         do=(f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* DID: {model_line}\n\nuse \"data.dta\", clear\n"
-                            f"xtset {id_col} {tc_col}\ngen post=({tc_col}>={t_med})\ngen treat={did_var}\ngen did=treat*post\n"
-                            f"reghdfe {y_col} {cx} {' '.join(ctrls)} treat post did, absorb({id_col}) vce(robust)\n"
-                            f"* 平行趋势检验: 画图看 pre-trend\n")
+                            f"xtset {id_col} {tc_col}\n{post_stata}\ngen treat={did_var}\ngen did=treat*post\n"
+                            f"reghdfe {y_col} {cx} {' '.join(ctrls)} treat post did, absorb({id_col}) vce(robust)\n")
                         with st.expander("Stata 复现代码"): st.code(do,language='stata')
                         dl1,dl2=st.columns(2)
                         dl1.download_button("下载 .do",do,file_name=f"{cx}_did.do",key=f'dl_{cx}_did_v7')
                     except Exception as e: st.error(f"DID 失败：{e}")
+
+                elif 'RDD' in model_sel:
+                    td=sub[[y_col]+Xv0].dropna(); Xd=sm.add_constant(td[Xv0])
+                    m=OLS(td[y_col].values,Xd).fit(cov_type='HC1')
+                    label_map={'_rdd_treat':'断点处理项','_rdd_running_c':'断点距离','_rdd_inter':'断点两侧斜率差','_rdd_running_c2':'断点距离²','_rdd_inter2':'二阶斜率差'}
+                    rows=[]
+                    for j,vn in enumerate(['const']+Xv0):
+                        b=m.params[vn]; se=m.bse[vn]; t=abs(b/se) if se>0 else 0; pv=m.pvalues[vn]
+                        s='***' if pv<0.01 else ('**' if pv<0.05 else ('*' if pv<0.1 else ''))
+                        rows.append({'变量':label_map.get(vn,vn),'系数':f"{b:.4f}{s}",'SE':f"({se:.4f})",'t':f"{t:.2f}",'p':f"{pv:.4f}"})
+                    st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
+                    bw_note='全样本' if not rdd_bandwidth else f'|running-cutoff|≤{rdd_bandwidth}'
+                    st.caption(f"RDD（Sharp）｜断点变量={rdd_running}｜cutoff={rdd_cutoff}｜{bw_note}｜N={len(td)}｜R²={m.rsquared:.4f}")
+                    rdd_ctrls=[v for v in Xv0 if v!='_rdd_treat']
+                    do=f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* RDD: {y_col} around cutoff {rdd_cutoff}\n\nuse \"data.dta\", clear\n"
+                    do+=f"gen rdd_running_c={rdd_running}-{rdd_cutoff}\ngen rdd_treat=({rdd_running}>={rdd_cutoff})\ngen rdd_inter=rdd_treat*rdd_running_c\n"
+                    if '二阶' in rdd_order:
+                        do+="gen rdd_running_c2=rdd_running_c^2\ngen rdd_inter2=rdd_treat*rdd_running_c2\n"
+                    if rdd_bandwidth and rdd_bandwidth>0:
+                        do+=f"keep if abs(rdd_running_c)<={rdd_bandwidth}\n"
+                    stata_vars='rdd_treat rdd_running_c rdd_inter'
+                    if '二阶' in rdd_order: stata_vars+=' rdd_running_c2 rdd_inter2'
+                    user_ctrls=[v for v in rdd_ctrls if not v.startswith('_rdd_')]
+                    if user_ctrls: stata_vars+=' '+' '.join(user_ctrls)
+                    do+=f"reg {y_col} {stata_vars}, robust\n"
+                    with st.expander("Stata 复现代码"): st.code(do,language='stata')
+                    dl1,dl2=st.columns(2)
+                    dl1.download_button("下载 .do",do,file_name=f"rdd_{y_col}.do",key=f'dlrdd_{cx}_v1')
+                    dl2.download_button("下载 .csv",pd.DataFrame(rows).to_csv(index=False),file_name=f"rdd_{y_col}.csv",mime="text/csv",key=f'csrdd_{cx}_v1')
 
                 elif model_sel.startswith('OLS') or 'Pooled' in model_sel:
                     td=sub[[y_col]+Xv0].dropna(); Xd=sm.add_constant(td[Xv0])
@@ -1811,7 +1982,7 @@ if st.session_state.df is not None:
                                     if ng<30:
                                         het_results.append({'分组':grp_label,'N':ng,'系数':'—','SE':'—','t值':'—','p值':'—','R²':'—','备注':'N<30'})
                                         continue
-                                    fit=refit_baseline(y_col,focus_cx,Xv0,grp_data,model_sel,is_panel,use_rob,id_col,tc_col,did_var=did_var,iv_endog=iv_endog,iv_insts=iv_insts,heckman_sel=heckman_sel)
+                                    fit=refit_baseline(y_col,focus_cx,Xv0,grp_data,model_sel,is_panel,use_rob,id_col,tc_col,did_var=did_var,iv_endog=iv_endog,iv_insts=iv_insts,heckman_sel=heckman_sel,did_policy_time=did_policy_time,did_post_var=did_post_var)
                                     if fit['success']:
                                         s='***' if fit['pval']<0.01 else ('**' if fit['pval']<0.05 else ('*' if fit['pval']<0.1 else ''))
                                         het_results.append({'分组':grp_label,'N':fit['n'],'系数':f"{fit['coef']:.4f}{s}",'SE':f"({fit['se']:.4f})",'t值':f"{fit['tstat']:.2f}",'p值':f"{fit['pval']:.4f}",'R²':f"{fit['rsq']:.3f}" if not np.isnan(fit['rsq']) else 'N/A','备注':''})
@@ -1852,7 +2023,7 @@ if st.session_state.df is not None:
                             id_col=st.session_state.get('_id_col'); tc_col=st.session_state.get('_tc_col')
                             needed=[y_col]+Xv0+([] if not is_panel else [id_col,tc_col])
                             base_data=df_aug[needed].dropna()
-                            baseline=refit_baseline(y_col,focus_cx,Xv0,base_data,model_sel,is_panel,use_rob,id_col,tc_col,did_var=did_var,iv_endog=iv_endog,iv_insts=iv_insts,heckman_sel=heckman_sel)
+                            baseline=refit_baseline(y_col,focus_cx,Xv0,base_data,model_sel,is_panel,use_rob,id_col,tc_col,did_var=did_var,iv_endog=iv_endog,iv_insts=iv_insts,heckman_sel=heckman_sel,did_policy_time=did_policy_time,did_post_var=did_post_var)
                             rob_results=[]
                             if baseline['success']:
                                 s='***' if baseline['pval']<0.01 else ('**' if baseline['pval']<0.05 else ('*' if baseline['pval']<0.1 else ''))
@@ -1873,7 +2044,7 @@ if st.session_state.df is not None:
                                         lo,hi=wdata[xv].quantile(pct/100),wdata[xv].quantile(1-pct/100)
                                         wdata[xv]=wdata[xv].clip(lo,hi)
                                 wdata=wdata.dropna()
-                                fit=refit_baseline(y_col,focus_cx,Xv0,wdata,model_sel,is_panel,use_rob,id_col,tc_col,did_var=did_var,iv_endog=iv_endog,iv_insts=iv_insts,heckman_sel=heckman_sel)
+                                fit=refit_baseline(y_col,focus_cx,Xv0,wdata,model_sel,is_panel,use_rob,id_col,tc_col,did_var=did_var,iv_endog=iv_endog,iv_insts=iv_insts,heckman_sel=heckman_sel,did_policy_time=did_policy_time,did_post_var=did_post_var)
                                 if fit['success']:
                                     s='***' if fit['pval']<0.01 else ('**' if fit['pval']<0.05 else ('*' if fit['pval']<0.1 else ''))
                                     rob_results.append({'检验方式':label,'N':fit['n'],'系数':f"{fit['coef']:.4f}{s}",'SE':f"({fit['se']:.4f})",'t值':f"{fit['tstat']:.2f}",'R²':f"{fit['rsq']:.3f}" if not np.isnan(fit['rsq']) else 'N/A'})
@@ -1882,7 +2053,7 @@ if st.session_state.df is not None:
                             # Sample dropping
                             if use_drop and drop_col:
                                 ddata=base_data[(base_data[drop_col]>=dmin)&(base_data[drop_col]<=dmax)]
-                                fit=refit_baseline(y_col,focus_cx,Xv0,ddata,model_sel,is_panel,use_rob,id_col,tc_col,did_var=did_var,iv_endog=iv_endog,iv_insts=iv_insts,heckman_sel=heckman_sel)
+                                fit=refit_baseline(y_col,focus_cx,Xv0,ddata,model_sel,is_panel,use_rob,id_col,tc_col,did_var=did_var,iv_endog=iv_endog,iv_insts=iv_insts,heckman_sel=heckman_sel,did_policy_time=did_policy_time,did_post_var=did_post_var)
                                 if fit['success']:
                                     s='***' if fit['pval']<0.01 else ('**' if fit['pval']<0.05 else ('*' if fit['pval']<0.1 else ''))
                                     rob_results.append({'检验方式':f'保留 {drop_col}∈[{dmin},{dmax}]','N':fit['n'],'系数':f"{fit['coef']:.4f}{s}",'SE':f"({fit['se']:.4f})",'t值':f"{fit['tstat']:.2f}",'R²':f"{fit['rsq']:.3f}" if not np.isnan(fit['rsq']) else 'N/A'})
