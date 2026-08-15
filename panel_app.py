@@ -318,6 +318,61 @@ def run_moderation_analysis(y_col, x, m, controls, df):
             'high_slope':hi_s,'high_se':hi_se,'high_t':hi_t,
             'rsq':float(mf.rsquared),'n':len(td)}
 
+def run_did_mediation_panel(td, y_col, med_col, controls, id_col, tc_col):
+    """DID mechanism test using current DID sample: _did -> M -> Y with entity FE."""
+    controls=[v for v in unique_keep_order(controls) if v in td.columns and v not in ['_treat','_post','_did',med_col,y_col,id_col,tc_col]]
+    need=unique_keep_order([id_col,tc_col,y_col,med_col,'_did','_post']+controls)
+    d=td[need].replace([np.inf,-np.inf],np.nan).dropna().copy()
+    if len(d)<30: return None,'有效样本量不足'
+    d[id_col]=d[id_col].astype(str)
+    d=d.set_index([id_col,tc_col])
+    base_x=[v for v in controls+['_post','_did'] if v in d.columns and d[v].nunique(dropna=True)>1]
+    if '_did' not in base_x: return None,'Treat×Post 没有变化'
+    m_x=[v for v in base_x if v!=med_col]
+    y_x=unique_keep_order([v for v in controls+['_post','_did',med_col] if v in d.columns and d[v].nunique(dropna=True)>1])
+    try:
+        r_y=safe_panel_fit(d[y_col],sm.add_constant(d[m_x]),entity_effects=True,time_effects=False)
+        r_m=safe_panel_fit(d[med_col],sm.add_constant(d[m_x]),entity_effects=True,time_effects=False)
+        r_full=safe_panel_fit(d[y_col],sm.add_constant(d[y_x]),entity_effects=True,time_effects=False)
+        c=float(r_y.params.get('_did',np.nan)); c_p=float(r_y.pvalues.get('_did',np.nan))
+        a=float(r_m.params.get('_did',np.nan)); a_p=float(r_m.pvalues.get('_did',np.nan))
+        b=float(r_full.params.get(med_col,np.nan)); b_p=float(r_full.pvalues.get(med_col,np.nan))
+        cp=float(r_full.params.get('_did',np.nan)); cp_p=float(r_full.pvalues.get('_did',np.nan))
+        ab=a*b
+        if np.isnan(a) or np.isnan(b):
+            effect_type='无法判断'
+        elif a_p<0.1 and b_p<0.1:
+            effect_type='机制成立'
+        elif c_p<0.1 and a_p<0.1:
+            effect_type='渠道成立'
+        else:
+            effect_type='暂不显著'
+        return {'c':c,'c_p':c_p,'a':a,'a_p':a_p,'b':b,'b_p':b_p,'cp':cp,'cp_p':cp_p,
+                'ab':ab,'effect_type':effect_type,'n':len(d),'controls':controls,
+                'rsq_y':float(r_y.rsquared),'rsq_m':float(r_m.rsquared),'rsq_full':float(r_full.rsquared)},None
+    except Exception as e:
+        return None,str(e)[:120]
+
+def run_did_moderation_panel(td, y_col, mod_col, controls, id_col, tc_col):
+    """DID moderation test using current DID sample: _did × M -> Y with entity FE."""
+    controls=[v for v in unique_keep_order(controls) if v in td.columns and v not in ['_treat','_post','_did',mod_col,y_col,id_col,tc_col]]
+    need=unique_keep_order([id_col,tc_col,y_col,mod_col,'_did','_post']+controls)
+    d=td[need].replace([np.inf,-np.inf],np.nan).dropna().copy()
+    if len(d)<30: return None,'有效样本量不足'
+    d['_did_x_m']=d['_did']*d[mod_col]
+    d[id_col]=d[id_col].astype(str)
+    d=d.set_index([id_col,tc_col])
+    x_vars=unique_keep_order([v for v in controls+['_post','_did',mod_col,'_did_x_m'] if v in d.columns and d[v].nunique(dropna=True)>1])
+    if '_did_x_m' not in x_vars: return None,'交互项没有变化'
+    try:
+        r=safe_panel_fit(d[y_col],sm.add_constant(d[x_vars]),entity_effects=True,time_effects=False)
+        b_did=float(r.params.get('_did',np.nan)); b_m=float(r.params.get(mod_col,np.nan))
+        b_inter=float(r.params.get('_did_x_m',np.nan)); p_inter=float(r.pvalues.get('_did_x_m',np.nan))
+        return {'b_did':b_did,'b_m':b_m,'b_inter':b_inter,'p_inter':p_inter,
+                'n':len(d),'controls':controls,'rsq':float(r.rsquared)},None
+    except Exception as e:
+        return None,str(e)[:120]
+
 def refit_baseline(y_col, focus_cx, Xv0, data, model_sel, is_panel, use_rob=False,
                    id_col=None, tc_col=None, did_var=None, iv_endog=None, iv_insts=None,
                    heckman_sel=None, did_policy_time=None, did_post_var=None):
@@ -1587,6 +1642,76 @@ if st.session_state.df is not None:
         search_mode=st.session_state.get('_search_mode','分别显著（各X独立搜索）')
         is_joint=('同时' in search_mode)
 
+        def did_followup_panel(base_td, control_terms, id_col, tc_col, post_stata, key_prefix, title_prefix):
+            st.divider()
+            st.subheader(f"{title_prefix} 后续分析")
+            st.caption("沿用当前选中的 DID 组合、样本、Treat、Post 和控制变量；无需回到上面重新搜索。")
+            base_keys=base_td[[id_col,tc_col,'_did','_post']].drop_duplicates().copy()
+            base_keys[id_col]=base_keys[id_col].astype(str)
+            all_follow=df_aug.copy()
+            all_follow[id_col]=all_follow[id_col].astype(str)
+            follow=base_keys.merge(all_follow,on=[id_col,tc_col],how='left',suffixes=('','_raw'))
+            for c in [y_col]+list(control_terms):
+                raw_c=f"{c}_raw"
+                if c not in follow.columns and raw_c in follow.columns:
+                    follow[c]=follow[raw_c]
+            num_candidates=[c for c in df_aug.columns
+                if c not in [id_col,tc_col,y_col,did_var,did_post_var,'_did','_treat','_post']
+                and c not in control_terms and pd.api.types.is_numeric_dtype(df_aug[c])]
+            if not num_candidates:
+                st.info("当前没有可用于机制/调节的数值变量。")
+                return
+            f1,f2=st.columns(2)
+            with f1:
+                run_med=st.checkbox("继续做机制分析", key=f'{key_prefix}_did_med_on')
+            with f2:
+                run_mod=st.checkbox("继续做调节分析", key=f'{key_prefix}_did_mod_on')
+            user_ctrls=[v for v in control_terms if v in df_aug.columns and not v.startswith('_')]
+            ctrl_text=(' '.join(user_ctrls)+' ') if user_ctrls else ''
+            if run_med:
+                med_m=st.selectbox("机制变量 M", num_candidates, key=f'{key_prefix}_did_med_m')
+                if st.button("运行机制分析", key=f'{key_prefix}_run_did_med'):
+                    mr,err=run_did_mediation_panel(follow,y_col,med_m,control_terms,id_col,tc_col)
+                    if err:
+                        st.error(f"机制分析失败：{err}")
+                    else:
+                        c1,c2,c3,c4=st.columns(4)
+                        with c1: st.metric("总效应 c",f"{mr['c']:.4f}",f"p={mr['c_p']:.4f}")
+                        with c2: st.metric("DID→M a",f"{mr['a']:.4f}",f"p={mr['a_p']:.4f}")
+                        with c3: st.metric("M→Y b",f"{mr['b']:.4f}",f"p={mr['b_p']:.4f}")
+                        with c4: st.metric("间接项 a×b",f"{mr['ab']:.4f}")
+                        if mr['effect_type'] in ['机制成立','渠道成立']:
+                            st.success(f"机制结果：{mr['effect_type']} ｜ N={mr['n']}")
+                        else:
+                            st.warning(f"机制结果：{mr['effect_type']} ｜ N={mr['n']}")
+                        st.caption(f"R²：总效应={mr['rsq_y']:.3f}，机制方程={mr['rsq_m']:.3f}，加入 M 后={mr['rsq_full']:.3f}")
+                        do=(f"* === 鹈鹕回归 (c)2026 · DID 机制分析 ===\nuse \"data.dta\", clear\n"
+                            f"xtset {id_col} {tc_col}\n{post_stata}\ngen treat={did_var}\ngen did=treat*post\n"
+                            f"* 第1步：DID 总效应\nreghdfe {y_col} {ctrl_text}post did, absorb({id_col}) vce(robust)\n"
+                            f"* 第2步：DID 对机制变量 M 的影响\nreghdfe {med_m} {ctrl_text}post did, absorb({id_col}) vce(robust)\n"
+                            f"* 第3步：加入机制变量 M\nreghdfe {y_col} {ctrl_text}post did {med_m}, absorb({id_col}) vce(robust)\n")
+                        with st.expander("机制分析 Stata 代码"): st.code(do,language='stata')
+            if run_mod:
+                mod_m=st.selectbox("调节变量 M", num_candidates, key=f'{key_prefix}_did_mod_m')
+                if st.button("运行调节分析", key=f'{key_prefix}_run_did_mod'):
+                    rr,err=run_did_moderation_panel(follow,y_col,mod_m,control_terms,id_col,tc_col)
+                    if err:
+                        st.error(f"调节分析失败：{err}")
+                    else:
+                        c1,c2,c3=st.columns(3)
+                        with c1: st.metric("DID 主效应",f"{rr['b_did']:.4f}")
+                        with c2: st.metric(f"{mod_m} 主效应",f"{rr['b_m']:.4f}")
+                        with c3: st.metric("DID×M",f"{rr['b_inter']:.4f}",f"p={rr['p_inter']:.4f}")
+                        if rr['p_inter']<0.1:
+                            st.success(f"调节项显著：{mod_m} 调节 Treat×Post 对 {y_col} 的影响 ｜ N={rr['n']}")
+                        else:
+                            st.warning(f"调节项暂不显著 ｜ N={rr['n']}")
+                        do=(f"* === 鹈鹕回归 (c)2026 · DID 调节分析 ===\nuse \"data.dta\", clear\n"
+                            f"xtset {id_col} {tc_col}\n{post_stata}\ngen treat={did_var}\ngen did=treat*post\n"
+                            f"gen did_x_{mod_m}=did*{mod_m}\n"
+                            f"reghdfe {y_col} {ctrl_text}post did {mod_m} did_x_{mod_m}, absorb({id_col}) vce(robust)\n")
+                        with st.expander("调节分析 Stata 代码"): st.code(do,language='stata')
+
         for cx,results in sr.items():
             if not results: st.warning(f"{cx}: 无有效组合"); continue
             display_cx='Treat×Post' if cx=='_did' else ('断点处理项' if cx=='_rdd_treat' else cx)
@@ -1741,6 +1866,7 @@ if st.session_state.df is not None:
                         with st.expander("Stata 复现代码"): st.code(do,language='stata')
                         dl1,dl2=st.columns(2)
                         dl1.download_button("下载 .do",do,file_name=f"{cx}_did.do",key=f'dl_{cx}_did_v7')
+                        did_followup_panel(td.copy(),control_terms,id_col,tc_col,post_stata,f'{cx}_did', 'DID')
                     except Exception as e: st.error(f"DID 失败：{e}")
 
                 elif is_panel and 'PSM-DID' in model_sel:
@@ -1822,6 +1948,7 @@ if st.session_state.df is not None:
                         dl1,dl2=st.columns(2)
                         dl1.download_button("下载 .do",do,file_name="psm_did.do",key='dl_psm_did_v8')
                         dl2.download_button("下载 .csv",pd.DataFrame(rows).to_csv(index=False),file_name="psm_did.csv",mime="text/csv",key='csv_psm_did_v8')
+                        did_followup_panel(td.copy(),control_terms,id_col,tc_col,post_stata,'psm_did', 'PSM-DID')
                     except Exception as e: st.error(f"PSM-DID 失败：{e}")
 
                 elif 'RDD' in model_sel:
