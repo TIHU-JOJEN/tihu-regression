@@ -155,6 +155,48 @@ def detect_y_type(y_series):
     if atmin>0.05 or atmax>0.05: return 'censored',{'at_min':atmin,'y_min':y.min()}
     return 'continuous',None
 
+def unique_keep_order(seq):
+    out=[]; seen=set()
+    for x in seq:
+        if x is not None and x not in seen:
+            out.append(x); seen.add(x)
+    return out
+
+def is_binary_series(s):
+    u=pd.Series(s).dropna().unique()
+    return len(u)==2
+
+def prepare_model_frame(data, y_col, x_vars, extra_cols=None, min_n=30, require_x=True):
+    """Build a numeric regression frame and remove regressors that cannot be estimated."""
+    x_vars=unique_keep_order([v for v in x_vars if v in data.columns and v!=y_col])
+    need=unique_keep_order([y_col]+x_vars+list(extra_cols or []))
+    td=data[need].replace([np.inf,-np.inf],np.nan).dropna().copy()
+    if len(td)<min_n:
+        return None, [], [], f'有效样本量 {len(td)} < {min_n}'
+    kept=[]; dropped=[]
+    for v in x_vars:
+        if v not in td.columns:
+            dropped.append((v,'不存在')); continue
+        td[v]=pd.to_numeric(td[v],errors='coerce')
+        if td[v].isna().any():
+            dropped.append((v,'非数值')); continue
+        if td[v].nunique(dropna=True)<=1:
+            dropped.append((v,'无变化')); continue
+        kept.append(v)
+    td=td[[y_col]+kept+list(extra_cols or [])].dropna()
+    if len(td)<min_n:
+        return None, kept, dropped, f'清理后有效样本量 {len(td)} < {min_n}'
+    if require_x and not kept:
+        return None, kept, dropped, '没有可用于估计的解释变量'
+    return td, kept, dropped, None
+
+def safe_panel_fit(y, X, entity_effects=True, time_effects=False, cov_type=None):
+    """PanelOLS wrapper: drop absorbed variables instead of failing on common DID cases."""
+    mod=PanelOLS(y,X,entity_effects=entity_effects,time_effects=time_effects,drop_absorbed=True,check_rank=False)
+    if cov_type:
+        return mod.fit(cov_type=cov_type)
+    return mod.fit()
+
 def run_mediation_wen2014(y_col, x, m, controls, df, n_boot=1000):
     """温忠麟 & 叶宝娟 (2014) 中介效应五步流程
     方程: (1) Y=cX (2) M=aX (3) Y=c'X+bM
@@ -340,7 +382,7 @@ def refit_baseline(y_col, focus_cx, Xv0, data, model_sel, is_panel, use_rob=Fals
                 'n':n,'rsq':float(m.rsquared)}
 
         # ── Logit / Probit / LPM ──
-        if 'Logit' in model_sel or 'Probit' in model_sel or 'LPM' in model_sel:
+        if 'Ordered' not in model_sel and ('Logit' in model_sel or 'Probit' in model_sel or 'LPM' in model_sel):
             need=[y_col]+[v for v in Xv0 if v in data.columns]
             td=data[need].dropna()
             n=len(td)
@@ -376,7 +418,8 @@ def refit_baseline(y_col, focus_cx, Xv0, data, model_sel, is_panel, use_rob=Fals
             n=len(td)
             if n<30: return {'success':False,'error':'样本量<30','n':n}
             Xv=[v for v in Xv0 if v in td.columns]
-            Xd=sm.add_constant(td[Xv])
+            if not Xv: return {'success':False,'error':'Ordered 模型需要解释变量','n':n}
+            Xd=td[Xv]
             distr='probit' if 'Probit' in model_sel else 'logit'
             m=OrderedModel(td[y_col].astype(int),Xd,distr=distr).fit(disp=0)
             b=m.params.get(focus_cx,np.nan); se=m.bse.get(focus_cx,np.nan)
@@ -446,10 +489,11 @@ def refit_baseline(y_col, focus_cx, Xv0, data, model_sel, is_panel, use_rob=Fals
             if n<30: return {'success':False,'error':'样本量<30','n':n}
             did_terms=['_treat','_post','_did']
             controls=[v for v in Xv0 if v in td.columns and v not in did_terms]
-            did_X=controls+did_terms
+            did_X=unique_keep_order(controls+['_post','_did'])
+            did_X=[v for v in did_X if td[v].nunique(dropna=True)>1]
+            if '_did' not in did_X: return {'success':False,'error':'DID 交互项没有变化，无法估计','n':n}
             X_did=sm.add_constant(td[did_X])
-            d_m=PanelOLS(td[y_col],X_did,entity_effects=True,time_effects=False)
-            d_r=d_m.fit()
+            d_r=safe_panel_fit(td[y_col],X_did,entity_effects=True,time_effects=False)
             b=d_r.params.get('_did',np.nan); se=d_r.std_errors.get('_did',np.nan)
             t=abs(b/se) if se>0 else 0
             df_eff=max(n-len(did_X)-td.index.get_level_values(0).nunique()-1,1)
@@ -479,22 +523,27 @@ def refit_baseline(y_col, focus_cx, Xv0, data, model_sel, is_panel, use_rob=Fals
             from sklearn.preprocessing import StandardScaler
             from sklearn.linear_model import LogisticRegression
             from sklearn.neighbors import NearestNeighbors as NN
-            cov_cols=[v for v in Xv0 if v in td.columns]
+            did_terms=['_treat','_post','_did']
+            cov_cols=[v for v in Xv0 if v in td.columns and v not in did_terms]
+            if not cov_cols:
+                return {'success':False,'error':'PSM-DID 至少需要 1 个匹配变量/控制变量','n':n_raw}
             pre_mask=td['_post']==0
             if pre_mask.sum()<10: return {'success':False,'error':'PSM-DID 预处理期样本不足','n':n_raw}
             pre_data=td[pre_mask][cov_cols+[did_var]].dropna()
+            if pre_data[did_var].nunique()<2:
+                return {'success':False,'error':'政策前样本中处理组变量没有两类','n':len(pre_data)}
             X_sc=StandardScaler().fit_transform(pre_data[cov_cols])
             D_p=pre_data[did_var].values
             ps=LogisticRegression(C=1e6,max_iter=1000).fit(X_sc,D_p).predict_proba(X_sc)[:,1]
             td=td.set_index([id_col,tc_col])
             n=len(td)
             if n<30: return {'success':False,'error':'样本量<30','n':n}
-            did_terms=['_treat','_post','_did']
             controls=[v for v in Xv0 if v in td.columns and v not in did_terms]
-            did_X=controls+did_terms
+            did_X=unique_keep_order(controls+['_post','_did'])
+            did_X=[v for v in did_X if td[v].nunique(dropna=True)>1]
+            if '_did' not in did_X: return {'success':False,'error':'PSM-DID 交互项没有变化，无法估计','n':n}
             X_did=sm.add_constant(td[did_X])
-            d_m=PanelOLS(td[y_col],X_did,entity_effects=True,time_effects=False)
-            d_r=d_m.fit()
+            d_r=safe_panel_fit(td[y_col],X_did,entity_effects=True,time_effects=False)
             b=d_r.params.get('_did',np.nan); se=d_r.std_errors.get('_did',np.nan)
             t=abs(b/se) if se>0 else 0
             df_eff=max(n-len(did_X)-td.index.get_level_values(0).nunique()-1,1)
@@ -504,10 +553,13 @@ def refit_baseline(y_col, focus_cx, Xv0, data, model_sel, is_panel, use_rob=Fals
         # ── PSM (倾向得分匹配) ──
         if 'PSM' in model_sel:
             if did_var is None: return {'success':False,'error':'PSM 需要处理变量','n':n_raw}
+            if not [v for v in Xv0 if v in data.columns]:
+                return {'success':False,'error':'PSM 至少需要 1 个匹配变量','n':n_raw}
             need=[y_col]+[v for v in Xv0 if v in data.columns]+[did_var]
             td=data[need].dropna()
             n=len(td)
             if n<30: return {'success':False,'error':'样本量<30','n':n}
+            if td[did_var].nunique()<2: return {'success':False,'error':'处理变量没有两类','n':n}
             D=td[did_var].values; y_p=td[y_col].values
             X_p=td[[v for v in Xv0 if v in td.columns]].values
             pr=psm_att(y_p,D,X_p,method='nearest',k=1)
@@ -1021,6 +1073,7 @@ if st.session_state.df is not None:
         if st.button(btn_label,type="primary",key='srch7'):
             if not core_x: st.warning("请选核心 X")
             elif (not is_did_like) and 'RDD' not in sel_model and (not ctrl_pool or len(ctrl_pool)<2): st.warning("候选池需 ≥2 个变量")
+            elif 'PSM-DID' in sel_model and not ctrl_pool: st.warning("PSM-DID 至少需要 1 个匹配变量/控制变量")
             elif len(ctrl_pool)<cmin: st.warning("候选池不足最少控制数")
             elif 'IV' in sel_model and len(iv_insts)<1: st.warning("工具变量至少选1个")
             else:
@@ -1046,6 +1099,28 @@ if st.session_state.df is not None:
                     sub=df_aug[use_vars].dropna().copy()
                     if 'RDD' in sel_model and rdd_bandwidth and rdd_bandwidth>0:
                         sub=sub[sub['_rdd_running_c'].abs()<=rdd_bandwidth].copy()
+
+                if len(sub)<30:
+                    st.error(f"缺失值处理后有效样本只有 {len(sub)} 行，无法稳定回归。请减少变量或先清洗数据。")
+                    st.stop()
+                if is_did_like:
+                    if did_var is None or did_var not in sub.columns or sub[did_var].nunique()<2:
+                        st.error("处理组变量需要同时包含处理组和对照组。")
+                        st.stop()
+                    if '_post' not in sub.columns or sub['_post'].nunique()<2:
+                        st.error("Post 变量需要同时包含政策前和政策后。")
+                        st.stop()
+                    if '_did' not in sub.columns or sub['_did'].nunique()<2:
+                        st.error("Treat×Post 没有变化，无法估计 DID。请检查处理组变量和政策时间。")
+                        st.stop()
+                if 'RDD' in sel_model:
+                    side_counts=sub['_rdd_treat'].value_counts()
+                    if len(side_counts)<2:
+                        st.error("断点两侧至少都要有样本。请调整 cutoff 或带宽。")
+                        st.stop()
+                    if side_counts.min()<10:
+                        st.error(f"断点一侧样本只有 {int(side_counts.min())} 行，容易回归失败。请放宽带宽或调整 cutoff。")
+                        st.stop()
 
                 # ── 通用搜索函数（OLS 快速筛选） ──
                 def search_ols(cx,pool,mn,mx):
@@ -1512,11 +1587,13 @@ if st.session_state.df is not None:
                     td_idx=td.set_index([id_col,tc_col])
                     did_terms=['_treat','_post','_did']
                     control_terms=[v for v in Xv0 if v not in did_terms]
-                    model_terms=[v for v in control_terms+did_terms if v in td_idx.columns]
+                    model_terms=unique_keep_order([v for v in control_terms+['_post','_did'] if v in td_idx.columns and td_idx[v].nunique(dropna=True)>1])
+                    if '_did' not in model_terms:
+                        st.error("DID 交互项没有变化，无法估计。请检查处理组变量和政策时间。")
+                        st.stop()
                     X_did=sm.add_constant(td_idx[model_terms])
                     try:
-                        d_m=PanelOLS(td_idx[y_col],X_did,entity_effects=True,time_effects=False)
-                        d_r=d_m.fit()
+                        d_r=safe_panel_fit(td_idx[y_col],X_did,entity_effects=True,time_effects=False)
                         st.info(f"DID 估计量（交互项 _did）= {d_r.params.get('_did',np.nan):.4f} (SE={d_r.std_errors.get('_did',np.nan):.4f}) ｜ {post_note}")
                         rows=[]
                         label_map={'_treat':'Treat（处理组）','_post':'Post（政策后）','_did':'Treat×Post（DID）'}
@@ -1530,7 +1607,8 @@ if st.session_state.df is not None:
                         ctrl_text=(' '.join(user_ctrls)+' ') if user_ctrls else ''
                         do=(f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* DID: {model_line}\n\nuse \"data.dta\", clear\n"
                             f"xtset {id_col} {tc_col}\n{post_stata}\ngen treat={did_var}\ngen did=treat*post\n"
-                            f"reghdfe {y_col} {ctrl_text}treat post did, absorb({id_col}) vce(robust)\n")
+                            f"* treat 通常会被个体固定效应吸收，估计式中保留 post 和 did\n"
+                            f"reghdfe {y_col} {ctrl_text}post did, absorb({id_col}) vce(robust)\n")
                         with st.expander("Stata 复现代码"): st.code(do,language='stata')
                         dl1,dl2=st.columns(2)
                         dl1.download_button("下载 .do",do,file_name=f"{cx}_did.do",key=f'dl_{cx}_did_v7')
@@ -1555,36 +1633,46 @@ if st.session_state.df is not None:
                     td['_did']=td['_treat']*td['_post']
                     did_terms=['_treat','_post','_did']
                     control_terms=[v for v in Xv0 if v not in did_terms]
-                    matched_note="未执行匹配：无可用控制变量，直接输出 DID"
+                    matched_note=""
                     try:
                         cov_cols=[v for v in control_terms if v in td.columns]
-                        if cov_cols:
-                            from sklearn.preprocessing import StandardScaler
-                            from sklearn.linear_model import LogisticRegression
-                            from sklearn.neighbors import NearestNeighbors as NN
-                            pre=td[td['_post']==0].copy()
-                            pre_unit=pre.groupby(id_col)[cov_cols+[did_var]].mean().dropna()
-                            treated_ids=pre_unit[pre_unit[did_var]>=0.5].index.astype(str).tolist()
-                            control_ids=pre_unit[pre_unit[did_var]<0.5].index.astype(str).tolist()
-                            if treated_ids and control_ids:
-                                X_sc=StandardScaler().fit_transform(pre_unit[cov_cols])
-                                D_p=(pre_unit[did_var]>=0.5).astype(int).values
-                                ps=LogisticRegression(C=1e6,max_iter=1000).fit(X_sc,D_p).predict_proba(X_sc)[:,1]
-                                ps_s=pd.Series(ps,index=pre_unit.index.astype(str))
-                                nn=NN(n_neighbors=1).fit(ps_s.loc[control_ids].values.reshape(-1,1))
-                                _,idx=nn.kneighbors(ps_s.loc[treated_ids].values.reshape(-1,1))
-                                matched_controls=[control_ids[i[0]] for i in idx]
-                                keep_ids=set(treated_ids+matched_controls)
-                                td=td[td[id_col].astype(str).isin(keep_ids)].copy()
-                                matched_note=f"匹配后样本：处理组 {len(treated_ids)} 个体，匹配控制组 {len(set(matched_controls))} 个体"
+                        if not cov_cols:
+                            st.error("PSM-DID 至少需要 1 个匹配变量/控制变量。")
+                            st.stop()
+                        from sklearn.preprocessing import StandardScaler
+                        from sklearn.linear_model import LogisticRegression
+                        from sklearn.neighbors import NearestNeighbors as NN
+                        pre=td[td['_post']==0].copy()
+                        pre_unit=pre.groupby(id_col)[cov_cols+[did_var]].mean().dropna()
+                        if pre_unit[did_var].nunique()<2:
+                            st.error("政策前样本中处理组变量没有两类，无法做 PSM-DID。")
+                            st.stop()
+                        treated_ids=pre_unit[pre_unit[did_var]>=0.5].index.astype(str).tolist()
+                        control_ids=pre_unit[pre_unit[did_var]<0.5].index.astype(str).tolist()
+                        if not treated_ids or not control_ids:
+                            st.error("政策前样本需要同时包含处理组和对照组。")
+                            st.stop()
+                        X_sc=StandardScaler().fit_transform(pre_unit[cov_cols])
+                        D_p=(pre_unit[did_var]>=0.5).astype(int).values
+                        ps=LogisticRegression(C=1e6,max_iter=1000).fit(X_sc,D_p).predict_proba(X_sc)[:,1]
+                        ps_s=pd.Series(ps,index=pre_unit.index.astype(str))
+                        nn=NN(n_neighbors=1).fit(ps_s.loc[control_ids].values.reshape(-1,1))
+                        _,idx=nn.kneighbors(ps_s.loc[treated_ids].values.reshape(-1,1))
+                        matched_controls=[control_ids[i[0]] for i in idx]
+                        keep_ids=set(treated_ids+matched_controls)
+                        td=td[td[id_col].astype(str).isin(keep_ids)].copy()
+                        matched_note=f"匹配后样本：处理组 {len(treated_ids)} 个体，匹配控制组 {len(set(matched_controls))} 个体"
                     except Exception as match_e:
-                        matched_note=f"匹配未成功，已回退为 DID：{str(match_e)[:60]}"
+                        st.error(f"PSM 匹配失败：{str(match_e)[:80]}")
+                        st.stop()
                     td_idx=td.set_index([id_col,tc_col])
-                    model_terms=[v for v in control_terms+did_terms if v in td_idx.columns]
+                    model_terms=unique_keep_order([v for v in control_terms+['_post','_did'] if v in td_idx.columns and td_idx[v].nunique(dropna=True)>1])
+                    if '_did' not in model_terms:
+                        st.error("PSM-DID 交互项没有变化，无法估计。")
+                        st.stop()
                     X_did=sm.add_constant(td_idx[model_terms])
                     try:
-                        d_m=PanelOLS(td_idx[y_col],X_did,entity_effects=True,time_effects=False)
-                        d_r=d_m.fit()
+                        d_r=safe_panel_fit(td_idx[y_col],X_did,entity_effects=True,time_effects=False)
                         st.info(f"PSM-DID 估计量（Treat×Post）= {d_r.params.get('_did',np.nan):.4f} (SE={d_r.std_errors.get('_did',np.nan):.4f}) ｜ {post_note}")
                         st.caption(matched_note)
                         rows=[]; label_map={'_treat':'Treat（处理组）','_post':'Post（政策后）','_did':'Treat×Post（PSM-DID）'}
@@ -1599,7 +1687,8 @@ if st.session_state.df is not None:
                         do=(f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* PSM-DID: {model_line}\n\nuse \"data.dta\", clear\n"
                             f"xtset {id_col} {tc_col}\n{post_stata}\ngen treat={did_var}\ngen did=treat*post\n"
                             f"* 可先用 psmatch2/teffects psmatch 在政策前样本匹配，再保留匹配样本\n"
-                            f"reghdfe {y_col} {ctrl_text}treat post did, absorb({id_col}) vce(robust)\n")
+                            f"* treat 通常会被个体固定效应吸收，估计式中保留 post 和 did\n"
+                            f"reghdfe {y_col} {ctrl_text}post did, absorb({id_col}) vce(robust)\n")
                         with st.expander("Stata 复现代码"): st.code(do,language='stata')
                         dl1,dl2=st.columns(2)
                         dl1.download_button("下载 .do",do,file_name="psm_did.do",key='dl_psm_did_v8')
@@ -1656,7 +1745,7 @@ if st.session_state.df is not None:
                     dl1.download_button("下载 .do",do,file_name=f"{cx}_ols.do",key=f'dlo_{cx}_v7')
                     dl2.download_button("下载 .csv",pd.DataFrame(rows).to_csv(index=False),file_name=f"{cx}_ols.csv",mime="text/csv",key=f'cso_{cx}_v7')
 
-                elif 'Logit' in model_sel or 'Probit' in model_sel or 'LPM' in model_sel:
+                elif 'Ordered' not in model_sel and ('Logit' in model_sel or 'Probit' in model_sel or 'LPM' in model_sel):
                     td=sub[[y_col]+Xv0].dropna(); Xd=sm.add_constant(td[Xv0]); y_d=td[y_col]
                     rows=[]; fit_lines=[]
                     run_lg='Logit' in model_sel or '+' in model_sel; run_pr='Probit' in model_sel or '+' in model_sel
