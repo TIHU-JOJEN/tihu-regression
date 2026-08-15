@@ -22,7 +22,8 @@ st.set_page_config(page_title="鹈鹕回归", layout="wide")
 
 for k, v in [('df',None),('df_name',None),('data_type',None),('diagnosed',False),
              ('id_col',None),('time_col',None),('balanced',None),('n_units',0),('n_periods',0),
-             ('search_results',None),('raw_df',None),('cleaning_log',[]),('cleaning_rules',[])]:
+             ('search_results',None),('raw_df',None),('cleaning_log',[]),('cleaning_rules',[]),
+             ('transform_log',[])]:
     if k not in st.session_state: st.session_state[k] = v
 
 # ── 免责声明模板（统一注入 Stata 代码头部） ──
@@ -161,6 +162,15 @@ def unique_keep_order(seq):
         if x is not None and x not in seen:
             out.append(x); seen.add(x)
     return out
+
+def make_unique_col(base, existing):
+    name=str(base).replace(' ','_')
+    if name not in existing:
+        return name
+    i=2
+    while f"{name}_{i}" in existing:
+        i+=1
+    return f"{name}_{i}"
 
 def is_binary_series(s):
     u=pd.Series(s).dropna().unique()
@@ -625,6 +635,7 @@ if uploaded is not None:
             st.session_state.id_col=None; st.session_state.time_col=None
             st.session_state.cleaning_log=[]
             st.session_state.cleaning_rules=[]
+            st.session_state.transform_log=[]
         except Exception as e: st.error(f"读取失败：{e}"); st.stop()
 
 if st.session_state.df is not None:
@@ -746,6 +757,7 @@ if st.session_state.df is not None:
                     logs.append(f'{method}：'+(', '.join(done) if done else '无可处理变量'))
             st.session_state.df=work
             st.session_state.diagnosed=False; st.session_state.search_results=None
+            st.session_state.transform_log=[]
             st.session_state.cleaning_log=logs if logs else ['未执行实际清洗操作']
             st.success(f"清洗完成：{before_shape[0]}行 × {before_shape[1]}列 → {work.shape[0]}行 × {work.shape[1]}列")
         if reset_clean:
@@ -753,6 +765,7 @@ if st.session_state.df is not None:
             st.session_state.diagnosed=False; st.session_state.search_results=None
             st.session_state.cleaning_log=[]
             st.session_state.cleaning_rules=[]
+            st.session_state.transform_log=[]
             st.success("已恢复为上传时的原始数据")
         if st.session_state.cleaning_log:
             st.info('当前清洗记录：'+'；'.join(st.session_state.cleaning_log))
@@ -813,6 +826,122 @@ if st.session_state.df is not None:
     # ═══════════════════ STEP 3: 变量 & 搜索 ═══════════════════
     if st.session_state.diagnosed:
         dt=st.session_state.data_type
+        st.header("Step 2.5 · 生成新变量（可选）")
+        st.caption("生成的新变量会保留原变量，不覆盖原数据；后续回归可以直接选择这些新变量。")
+        num_cols_now=[c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        with st.expander("打开新变量生成", expanded=False):
+            trans_method=st.selectbox("生成方式", [
+                "取对数 ln(x)",
+                "平方项 x²",
+                "相乘 / 交互项 x1×x2",
+                "标准化 z-score",
+                "滞后一期 L1",
+                "一阶差分 D1"
+            ], key='trans_method_v1')
+            can_panel_time=dt in ['panel','timeseries']
+            if trans_method in ["取对数 ln(x)","平方项 x²","标准化 z-score"]:
+                trans_cols=st.multiselect("选择变量", num_cols_now, key='trans_cols_v1')
+            elif trans_method=="相乘 / 交互项 x1×x2":
+                cta,ctb=st.columns(2)
+                with cta:
+                    trans_a=st.selectbox("变量 1", num_cols_now, key='trans_a_v1') if num_cols_now else None
+                with ctb:
+                    trans_b=st.selectbox("变量 2", num_cols_now, key='trans_b_v1') if num_cols_now else None
+                default_name=f"{trans_a}_x_{trans_b}" if trans_a and trans_b else ""
+                custom_name=st.text_input("新变量名", value=default_name, key='trans_inter_name_v1')
+            else:
+                trans_cols=st.multiselect("选择变量", num_cols_now, key='trans_panel_cols_v1')
+                if not can_panel_time:
+                    st.warning("滞后和差分需要先诊断为面板数据或时间序列数据。")
+
+            add_trans=st.button("生成变量", type='primary', key='add_transform_v1')
+            clear_trans=st.button("清空生成记录", key='clear_transform_log_v1')
+            if clear_trans:
+                st.session_state.transform_log=[]
+                st.success("已清空生成记录；已生成的变量仍保留在当前数据中。")
+            if add_trans:
+                work=df.copy(); logs=[]; existing=set(work.columns)
+                try:
+                    if trans_method=="取对数 ln(x)":
+                        if not trans_cols:
+                            st.warning("请选择变量")
+                        else:
+                            for c in trans_cols:
+                                new_c=make_unique_col(f"ln_{c}", existing)
+                                vals=pd.to_numeric(work[c],errors='coerce')
+                                work[new_c]=np.where(vals>0,np.log(vals),np.nan)
+                                existing.add(new_c); logs.append(f"{new_c}=ln({c})")
+                    elif trans_method=="平方项 x²":
+                        if not trans_cols:
+                            st.warning("请选择变量")
+                        else:
+                            for c in trans_cols:
+                                new_c=make_unique_col(f"{c}_sq", existing)
+                                vals=pd.to_numeric(work[c],errors='coerce')
+                                work[new_c]=vals**2
+                                existing.add(new_c); logs.append(f"{new_c}={c}²")
+                    elif trans_method=="标准化 z-score":
+                        if not trans_cols:
+                            st.warning("请选择变量")
+                        else:
+                            for c in trans_cols:
+                                vals=pd.to_numeric(work[c],errors='coerce')
+                                sd=vals.std()
+                                if sd and not np.isnan(sd):
+                                    new_c=make_unique_col(f"z_{c}", existing)
+                                    work[new_c]=(vals-vals.mean())/sd
+                                    existing.add(new_c); logs.append(f"{new_c}=z({c})")
+                    elif trans_method=="相乘 / 交互项 x1×x2":
+                        if not trans_a or not trans_b:
+                            st.warning("请选择两个变量")
+                        else:
+                            new_c=make_unique_col(custom_name or f"{trans_a}_x_{trans_b}", existing)
+                            work[new_c]=pd.to_numeric(work[trans_a],errors='coerce')*pd.to_numeric(work[trans_b],errors='coerce')
+                            logs.append(f"{new_c}={trans_a}×{trans_b}")
+                    elif trans_method in ["滞后一期 L1","一阶差分 D1"]:
+                        if not can_panel_time:
+                            st.warning("请先完成面板或时间序列诊断")
+                        elif not trans_cols:
+                            st.warning("请选择变量")
+                        else:
+                            if dt=='panel':
+                                id_col=st.session_state.id_col; tc_col=st.session_state.time_col
+                                work=work.sort_values([id_col,tc_col]).copy()
+                                for c in trans_cols:
+                                    if trans_method=="滞后一期 L1":
+                                        new_c=make_unique_col(f"L1_{c}", existing)
+                                        work[new_c]=work.groupby(id_col)[c].shift(1)
+                                        logs.append(f"{new_c}=L1.{c}")
+                                    else:
+                                        new_c=make_unique_col(f"D1_{c}", existing)
+                                        work[new_c]=work.groupby(id_col)[c].diff(1)
+                                        logs.append(f"{new_c}=D1.{c}")
+                                    existing.add(new_c)
+                            else:
+                                ts_time=st.session_state.get('_ts_time')
+                                work=work.sort_values(ts_time).copy() if ts_time in work.columns else work.copy()
+                                for c in trans_cols:
+                                    if trans_method=="滞后一期 L1":
+                                        new_c=make_unique_col(f"L1_{c}", existing)
+                                        work[new_c]=work[c].shift(1)
+                                        logs.append(f"{new_c}=L1.{c}")
+                                    else:
+                                        new_c=make_unique_col(f"D1_{c}", existing)
+                                        work[new_c]=work[c].diff(1)
+                                        logs.append(f"{new_c}=D1.{c}")
+                                    existing.add(new_c)
+                    if logs:
+                        st.session_state.df=work
+                        st.session_state.search_results=None
+                        st.session_state.transform_log=st.session_state.transform_log+logs
+                        st.success("已生成："+'；'.join(logs[:6])+(' 等' if len(logs)>6 else ''))
+                        df=st.session_state.df
+                        cols=df.columns.tolist()
+                except Exception as e:
+                    st.error(f"生成失败：{e}")
+            if st.session_state.transform_log:
+                st.info("已生成变量："+"；".join(st.session_state.transform_log[-12:]))
+
         st.header(f"Step 3 · 变量分配 & 搜索")
 
         if dt=='timeseries':
