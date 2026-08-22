@@ -38,22 +38,30 @@ LEGAL_HEADER = """* ============================================================
 
 def render_home_hero():
     art = [
-        "................",
-        ".....bbbb.......",
-        "....bbbbbb......",
-        "...bbbbbbee.....",
-        "..bbbbbbbeee....",
-        "..bbbbbbbeeeo...",
-        "...bbbbbbbeeo...",
-        "....bbbbbb......",
-        ".....bbbbyy.....",
-        "......bbyyy.....",
-        ".......yyyy.....",
-        ".......y..y.....",
-        "......y....y....",
-        "................",
+        "............................",
+        "...............nnn..........",
+        ".............nnnnnn.........",
+        "............nnnnnnhhhh......",
+        "...........nnnnnnhhohhh.....",
+        "..........nnnnnnhhhhhhhh....",
+        ".........nnnnnnwwwhhhhhh....",
+        ".......bbbbbbnnwwweeeeeee...",
+        "......bbbbbbbbnnweeeeeee....",
+        ".....bbbbbbbbbbnweeee.......",
+        "....bbbbbbbbbbbbww..........",
+        "...bbbbbbbbbbbbwww..........",
+        "...bbbbbbbbbwwwwww..........",
+        "....bbbbbbwwwwww............",
+        ".....bbbbbbbb...............",
+        "......bbbbbb................",
+        "........yyyy................",
+        "........yyyy................",
+        ".......yy..yy...............",
+        "......yy....yy..............",
+        "....ssssssssssssss..........",
+        "...ssssssssssssssss.........",
     ]
-    classes = {'.':'empty','b':'body','e':'beak','o':'eye','y':'leg'}
+    classes = {'.':'empty','b':'body','n':'neck','h':'head','w':'wing','e':'beak','o':'eye','y':'leg','s':'shadow'}
     cells = ''.join(f'<span class="px {classes[ch]}"></span>' for row in art for ch in row)
     st.markdown(f"""
     <style>
@@ -106,36 +114,33 @@ def render_home_hero():
       .pixel-stage {{
         margin-top: 28px;
         display: flex;
-        align-items: end;
-        gap: 20px;
+        align-items: center;
       }}
       .pixel-pelican {{
         display: grid;
-        grid-template-columns: repeat(16, 15px);
-        grid-auto-rows: 15px;
-        gap: 3px;
-        padding: 18px;
-        border-radius: 14px;
+        grid-template-columns: repeat(28, 10px);
+        grid-auto-rows: 10px;
+        gap: 2px;
+        padding: 22px;
+        border-radius: 16px;
         background: #ffffff;
         border: 1px solid #d8e2dd;
         box-shadow: inset 0 0 0 1px rgba(255,255,255,.75), 0 12px 30px rgba(20,33,29,.08);
       }}
       .px {{
-        width: 15px;
-        height: 15px;
-        border-radius: 3px;
+        width: 10px;
+        height: 10px;
+        border-radius: 2px;
       }}
       .px.empty {{ background: transparent; }}
       .px.body {{ background: #0b6b6e; }}
+      .px.neck {{ background: #147f82; }}
+      .px.head {{ background: #1a9a9d; }}
+      .px.wing {{ background: #164b57; }}
       .px.beak {{ background: #ee6b5b; }}
       .px.eye {{ background: #17211d; }}
       .px.leg {{ background: #e0a72e; }}
-      .pixel-caption {{
-        max-width: 220px;
-        color: #627069;
-        font-size: 14px;
-        line-height: 1.55;
-      }}
+      .px.shadow {{ background: #b8d8d5; }}
       .pelican-flow {{
         background: rgba(255,255,255,.82);
         border: 1px solid #dfe7e2;
@@ -197,17 +202,16 @@ def render_home_hero():
           padding: 24px;
         }}
         .pixel-stage {{
-          flex-direction: column;
           align-items: start;
         }}
         .pixel-pelican {{
-          grid-template-columns: repeat(16, 12px);
-          grid-auto-rows: 12px;
+          grid-template-columns: repeat(28, 7px);
+          grid-auto-rows: 7px;
           gap: 2px;
         }}
         .px {{
-          width: 12px;
-          height: 12px;
+          width: 7px;
+          height: 7px;
         }}
       }}
     </style>
@@ -222,7 +226,6 @@ def render_home_hero():
         </div>
         <div class="pixel-stage">
           <div class="pixel-pelican" aria-label="abstract pixel pelican">{cells}</div>
-          <div class="pixel-caption">抽象几何像素鹈鹕：轻量、稳定，不依赖外部图片资源。</div>
         </div>
       </div>
       <div class="pelican-flow">
@@ -358,6 +361,74 @@ def detect_y_type(y_series):
     atmin=(y==y.min()).mean(); atmax=(y==y.max()).mean()
     if atmin>0.05 or atmax>0.05: return 'censored',{'at_min':atmin,'y_min':y.min()}
     return 'continuous',None
+
+def assess_rdd_readiness(data, y_col, y_type, candidate_cols):
+    """Return RD-ready running variables based on observable data support."""
+    info={'recommended':False,'candidates':[],'reasons':[]}
+    if y_type!='continuous':
+        info['reasons'].append("被解释变量 Y 不是连续型；当前 RD 模块按连续结局的局部线性断点模型估计。")
+        return info
+    if not candidate_cols:
+        info['reasons'].append("没有可作为断点变量的数值列。")
+        return info
+
+    fail_reasons=[]
+    for c in candidate_cols:
+        pair=data[[y_col,c]].replace([np.inf,-np.inf],np.nan).dropna()
+        if len(pair)<80:
+            fail_reasons.append(f"{c}：有效样本不足 80。")
+            continue
+        x=pd.to_numeric(pair[c],errors='coerce').dropna()
+        if len(x)<80:
+            fail_reasons.append(f"{c}：有效数值样本不足 80。")
+            continue
+        nunique=int(x.nunique())
+        min_unique=max(20,min(50,int(len(x)*0.08)))
+        if nunique<min_unique:
+            fail_reasons.append(f"{c}：不同取值太少（{nunique} 个），更像分组/离散变量。")
+            continue
+        if x.std()==0:
+            fail_reasons.append(f"{c}：没有有效波动。")
+            continue
+
+        cutoffs=[]
+        if x.min()<0<x.max():
+            cutoffs.append(0.0)
+        for q in [0.25,0.5,0.75]:
+            val=float(x.quantile(q))
+            if all(abs(val-v)>1e-12 for v in cutoffs):
+                cutoffs.append(val)
+
+        best=None
+        n=len(x)
+        min_side=max(25,int(n*0.15))
+        local_n=max(50,int(n*0.35))
+        for cutoff in cutoffs:
+            left=int((x<cutoff).sum()); right=int((x>=cutoff).sum())
+            if left<min_side or right<min_side:
+                continue
+            tmp=pair.copy()
+            tmp['_rdd_absdist']=(pd.to_numeric(tmp[c],errors='coerce')-cutoff).abs()
+            local=tmp.nsmallest(local_n,'_rdd_absdist')
+            l_left=int((local[c]<cutoff).sum()); l_right=int((local[c]>=cutoff).sum())
+            min_local=max(10,int(len(local)*0.2))
+            if l_left<min_local or l_right<min_local:
+                continue
+            score=min(left,right)+min(l_left,l_right)
+            if best is None or score>best['score']:
+                best={'name':c,'cutoff':float(cutoff),'n':n,'unique':nunique,
+                      'left':left,'right':right,'local_left':l_left,'local_right':l_right,
+                      'score':score}
+        if best:
+            info['candidates'].append(best)
+        else:
+            fail_reasons.append(f"{c}：候选 cutoff 两侧或局部窗口样本支撑不足。")
+
+    info['candidates'].sort(key=lambda d:d['score'],reverse=True)
+    info['recommended']=len(info['candidates'])>0
+    if not info['recommended']:
+        info['reasons']=fail_reasons[:6] if fail_reasons else ["没有断点两侧样本支撑足够的连续运行变量。"]
+    return info
 
 def unique_keep_order(seq):
     out=[]; seen=set()
@@ -1275,6 +1346,8 @@ if st.session_state.df is not None:
 
         y_col=st.selectbox("被解释变量 Y",[c for c in all_num if c not in excl],key='y7')
         y_type,y_info=detect_y_type(df[y_col])
+        rdd_info={'recommended':False,'candidates':[],'reasons':[]}
+        rdd_candidate_names=[]; rdd_cutoff_defaults={}
 
         # 模型选择
         model_options=[]
@@ -1294,7 +1367,12 @@ if st.session_state.df is not None:
             elif y_type=='ordered': model_options=['Ordered Logit','Ordered Probit']
             elif y_type=='count': model_options=['Poisson','负二项（Negative Binomial）']
             elif y_type=='censored': model_options=['OLS+稳健SE','Tobit（截断回归）']
-            else: model_options=['OLS','OLS+稳健SE','Tobit（如被截断）','Heckman（样本选择）','RDD（断点回归）']
+            else: model_options=['OLS','OLS+稳健SE','Tobit（如被截断）','Heckman（样本选择）']
+            rdd_info=assess_rdd_readiness(df, y_col, y_type, [c for c in all_num if c not in excl and c!=y_col])
+            if rdd_info['recommended']:
+                model_options.append('RDD（断点回归）')
+                rdd_candidate_names=[d['name'] for d in rdd_info['candidates']]
+                rdd_cutoff_defaults={d['name']:d['cutoff'] for d in rdd_info['candidates']}
             model_options.append('PSM（倾向得分匹配）')
             model_options.append('IV/2SLS（工具变量）')
             if cat_cols:
@@ -1302,6 +1380,11 @@ if st.session_state.df is not None:
                     model_options.append('ANOVA/组间比较（分类变量）')
                 if y_type in ['continuous','binary','count']:
                     model_options.append('交互效应（分类×连续）')
+            if not rdd_info['recommended']:
+                with st.expander("RDD 未被推荐的原因", expanded=False):
+                    st.caption("触发条件：连续型 Y；存在连续运行变量；候选 cutoff 两侧以及 cutoff 附近局部窗口都有足够样本。")
+                    for reason in rdd_info['reasons']:
+                        st.write(f"- {reason}")
 
         sel_model=st.radio("模型",model_options,horizontal=False,key='mdl7')
 
@@ -1354,13 +1437,13 @@ if st.session_state.df is not None:
             pool_opt=[c for c in rem if c not in [did_var,did_post_var]]
             st.caption("DID/PSM-DID 不需要再选择核心 X；搜索目标自动固定为 Treat×Post，下面只选择控制变量候选池。")
         elif 'RDD' in sel_model:
-            rdd_candidates=[c for c in all_num if c not in excl and c!=y_col]
+            rdd_candidates=rdd_candidate_names or [c for c in all_num if c not in excl and c!=y_col]
             rdd_running=st.selectbox("断点变量 / Running variable", rdd_candidates, key='rdd_run_v1') if rdd_candidates else None
             if not rdd_running:
                 st.warning("RDD 需要至少一个数值型断点变量"); st.stop()
             rdd_design=st.radio("RD 类型", ['Sharp RD（精确断点）','Fuzzy RD（模糊断点 / 工具变量）'], horizontal=True, key='rdd_design_v2')
             rv=df_aug[rdd_running].dropna()
-            default_cut=float(rv.median()) if len(rv) else 0.0
+            default_cut=float(rdd_cutoff_defaults.get(rdd_running, rv.median() if len(rv) else 0.0))
             c_rdd1,c_rdd2,c_rdd3=st.columns(3)
             with c_rdd1: rdd_cutoff=st.number_input("断点值 cutoff", value=default_cut, key='rdd_cut_v1')
             with c_rdd2: rdd_bandwidth=st.number_input("带宽（0=不限制）", min_value=0.0, value=0.0, key='rdd_bw_v1')
