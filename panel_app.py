@@ -1144,6 +1144,7 @@ if st.session_state.df is not None:
         # 核心X + 控制变量（含虚拟变量）
         rem=[c for c in all_vars if c!=y_col]
         fixed_controls=[]; rdd_running=None; rdd_cutoff=None; rdd_bandwidth=0.0; rdd_order='局部线性（一阶）'
+        rdd_design='Sharp RD（精确断点）'; rdd_treatment=None
         if is_did_like:
             core_x=['_did']
             fixed_controls=['_treat','_post']
@@ -1154,23 +1155,34 @@ if st.session_state.df is not None:
             rdd_running=st.selectbox("断点变量 / Running variable", rdd_candidates, key='rdd_run_v1') if rdd_candidates else None
             if not rdd_running:
                 st.warning("RDD 需要至少一个数值型断点变量"); st.stop()
+            rdd_design=st.radio("RD 类型", ['Sharp RD（精确断点）','Fuzzy RD（模糊断点 / 工具变量）'], horizontal=True, key='rdd_design_v2')
             rv=df_aug[rdd_running].dropna()
             default_cut=float(rv.median()) if len(rv) else 0.0
             c_rdd1,c_rdd2,c_rdd3=st.columns(3)
             with c_rdd1: rdd_cutoff=st.number_input("断点值 cutoff", value=default_cut, key='rdd_cut_v1')
             with c_rdd2: rdd_bandwidth=st.number_input("带宽（0=不限制）", min_value=0.0, value=0.0, key='rdd_bw_v1')
             with c_rdd3: rdd_order=st.radio("阶数", ['局部线性（一阶）','二阶多项式'], horizontal=False, key='rdd_order_v1')
-            df_aug['_rdd_treat']=(df_aug[rdd_running]>=rdd_cutoff).astype(float)
+            df_aug['_rdd_z']=(df_aug[rdd_running]>=rdd_cutoff).astype(float)
+            df_aug['_rdd_treat']=df_aug['_rdd_z']
             df_aug['_rdd_running_c']=df_aug[rdd_running]-rdd_cutoff
-            df_aug['_rdd_inter']=df_aug['_rdd_treat']*df_aug['_rdd_running_c']
+            df_aug['_rdd_inter']=df_aug['_rdd_z']*df_aug['_rdd_running_c']
             fixed_controls=['_rdd_running_c','_rdd_inter']
             if '二阶' in rdd_order:
                 df_aug['_rdd_running_c2']=df_aug['_rdd_running_c']**2
-                df_aug['_rdd_inter2']=df_aug['_rdd_treat']*df_aug['_rdd_running_c2']
+                df_aug['_rdd_inter2']=df_aug['_rdd_z']*df_aug['_rdd_running_c2']
                 fixed_controls+=['_rdd_running_c2','_rdd_inter2']
-            core_x=['_rdd_treat']
-            pool_opt=[c for c in rem if c!=rdd_running]
-            st.caption("RDD 将自动生成断点处理项，并固定控制 running variable、断点两侧斜率项；候选控制变量仍由用户选择。")
+            if rdd_design.startswith('Fuzzy'):
+                treat_candidates=[c for c in all_num if c not in excl and c not in [y_col,rdd_running]]
+                if not treat_candidates:
+                    st.warning("Fuzzy RD 需要一个实际处理变量 D"); st.stop()
+                rdd_treatment=st.selectbox("实际处理变量 D（断点只改变接受处理的概率）", treat_candidates, key='rdd_d_v2')
+                core_x=[rdd_treatment]
+                pool_opt=[c for c in rem if c not in [rdd_running,rdd_treatment]]
+                st.caption("Fuzzy RD：用 Z=1(running≥cutoff) 作为工具变量估计 D 对 Y 的局部平均处理效应（LATE）。")
+            else:
+                core_x=['_rdd_treat']
+                pool_opt=[c for c in rem if c!=rdd_running]
+                st.caption("Sharp RD：断点直接决定处理状态；估计断点处结果变量的跳跃。")
         else:
             core_x=st.multiselect("核心 X（最多 8 个）",rem,default=rem[:1] if rem else [],max_selections=8,key='cx7')
             pool_opt=[c for c in rem if c not in core_x]
@@ -1280,6 +1292,8 @@ if st.session_state.df is not None:
                     use_vars=[y_col]+core_x+fixed_controls+ctrl_pool
                     if did_var: use_vars.append(did_var)
                     if did_post_var and did_post_var not in use_vars: use_vars.append(did_post_var)
+                    if 'RDD' in sel_model and rdd_design.startswith('Fuzzy') and '_rdd_z' not in use_vars:
+                        use_vars.append('_rdd_z')
                     sub=df_aug[use_vars].dropna().copy()
                     if 'RDD' in sel_model and rdd_bandwidth and rdd_bandwidth>0:
                         sub=sub[sub['_rdd_running_c'].abs()<=rdd_bandwidth].copy()
@@ -1298,13 +1312,18 @@ if st.session_state.df is not None:
                         st.error("Treat×Post 没有变化，无法估计 DID。请检查处理组变量和政策时间。")
                         st.stop()
                 if 'RDD' in sel_model:
-                    side_counts=sub['_rdd_treat'].value_counts()
+                    side_var='_rdd_z' if '_rdd_z' in sub.columns else '_rdd_treat'
+                    side_counts=sub[side_var].value_counts()
                     if len(side_counts)<2:
                         st.error("断点两侧至少都要有样本。请调整 cutoff 或带宽。")
                         st.stop()
                     if side_counts.min()<10:
                         st.error(f"断点一侧样本只有 {int(side_counts.min())} 行，容易回归失败。请放宽带宽或调整 cutoff。")
                         st.stop()
+                    if rdd_design.startswith('Fuzzy'):
+                        if rdd_treatment not in sub.columns or sub[rdd_treatment].nunique()<2:
+                            st.error("Fuzzy RD 的实际处理变量 D 需要有变化。")
+                            st.stop()
 
                 # ── 通用搜索函数（OLS 快速筛选） ──
                 def search_ols(cx,pool,mn,mx):
@@ -1364,6 +1383,39 @@ if st.session_state.df is not None:
                                 ols_params=ols_p,all_Xv=Xv))
                         except: continue
                     res.sort(key=lambda x: x['min_abs_tstat'],reverse=True)
+                    return res
+
+                def search_fuzzy_rdd(cx,pool,mn,mx):
+                    res=[]; ac=[]
+                    for k in range(mn,mx+1): ac.extend(combinations(pool,k))
+                    n_total=len(ac)
+                    if n_total>10000:
+                        rng=np.random.RandomState(42)
+                        ac=[ac[i] for i in rng.choice(n_total,10000,replace=False)]
+                        n_total=10000
+                    for i,combo in enumerate(ac):
+                        if i%500==0: progress.progress(min(i/max(n_total,1),.95),text=f"Fuzzy RD: {i}/{n_total}")
+                        try:
+                            exog_vars=unique_keep_order(fixed_controls+list(combo))
+                            need=[y_col,cx,'_rdd_z']+exog_vars
+                            td=sub[need].replace([np.inf,-np.inf],np.nan).dropna()
+                            if len(td)<30 or td['_rdd_z'].nunique()<2 or td[cx].nunique()<2: continue
+                            exog=sm.add_constant(td[exog_vars]) if exog_vars else sm.add_constant(pd.DataFrame(index=td.index))
+                            iv_m=IV2SLS(td[y_col],exog,td[[cx]],td[['_rdd_z']]).fit(cov_type='robust')
+                            b=iv_m.params.get(cx,np.nan); se=iv_m.std_errors.get(cx,np.nan)
+                            if np.isnan(b) or np.isnan(se) or se<=0: continue
+                            fs=OLS(td[cx],sm.add_constant(td[exog_vars+['_rdd_z']])).fit(cov_type='HC1')
+                            rf=OLS(td[y_col],sm.add_constant(td[exog_vars+['_rdd_z']])).fit(cov_type='HC1')
+                            res.append(dict(controls=tuple(fixed_controls)+tuple(combo),n=len(td),
+                                tstat=float(b/se),pval=float(iv_m.pvalues.get(cx,np.nan)),
+                                rsq=np.nan,rsq_adj=np.nan,
+                                iv_beta=float(b),iv_se=float(se),
+                                first_stage=float(fs.params.get('_rdd_z',np.nan)),
+                                first_stage_p=float(fs.pvalues.get('_rdd_z',np.nan)),
+                                reduced_form=float(rf.params.get('_rdd_z',np.nan)),
+                                reduced_form_p=float(rf.pvalues.get('_rdd_z',np.nan))))
+                        except: continue
+                    res.sort(key=lambda x: abs(x['tstat']),reverse=True)
                     return res
 
                 # ── 面板搜索（完整 FE+RE+Hausman） ──
@@ -1563,6 +1615,8 @@ if st.session_state.df is not None:
                         stxt.text(f"搜索 {cx}...")
                         if dt=='panel' and 'FE+RE' in sel_model:
                             sr[cx]=search_panel_full(cx,ctrl_pool,amn,amx)[:50]
+                        elif 'RDD' in sel_model and rdd_design.startswith('Fuzzy'):
+                            sr[cx]=search_fuzzy_rdd(cx,ctrl_pool,amn,amx)[:50]
                         else:
                             sr[cx]=search_ols(cx,ctrl_pool,amn,amx)[:50]
                         stxt.text(f"{cx}: {len(sr[cx])} 个有效组合")
@@ -1606,6 +1660,7 @@ if st.session_state.df is not None:
                 st.session_state._did_var=did_var; st.session_state._use_cl=use_cl
                 st.session_state._did_policy_time=did_policy_time; st.session_state._did_post_var=did_post_var; st.session_state._did_post_mode=did_post_mode
                 st.session_state._rdd_running=rdd_running; st.session_state._rdd_cutoff=rdd_cutoff; st.session_state._rdd_bandwidth=rdd_bandwidth; st.session_state._rdd_order=rdd_order
+                st.session_state._rdd_design=rdd_design; st.session_state._rdd_treatment=rdd_treatment
                 st.session_state._cluster_col=cluster_col
                 st.session_state._se_mode=se_mode; st.session_state._use_rob=use_rob
                 st.session_state._heckman_sel=heckman_sel
@@ -1633,6 +1688,7 @@ if st.session_state.df is not None:
         did_var=st.session_state._did_var; use_cl=st.session_state._use_cl
         did_policy_time=st.session_state.get('_did_policy_time',None); did_post_var=st.session_state.get('_did_post_var',None); did_post_mode=st.session_state.get('_did_post_mode','按政策时间生成 Post')
         rdd_running=st.session_state.get('_rdd_running',None); rdd_cutoff=st.session_state.get('_rdd_cutoff',None); rdd_bandwidth=st.session_state.get('_rdd_bandwidth',0.0); rdd_order=st.session_state.get('_rdd_order','局部线性（一阶）')
+        rdd_design=st.session_state.get('_rdd_design','Sharp RD（精确断点）'); rdd_treatment=st.session_state.get('_rdd_treatment',None)
         cluster_col=st.session_state.get('_cluster_col',None)
         se_mode=st.session_state.get('_se_mode','ordinary'); use_rob=st.session_state.get('_use_rob',False)
         heckman_sel=st.session_state._heckman_sel
@@ -1738,6 +1794,7 @@ if st.session_state.df is not None:
                 else:
                     s='***' if r['pval']<0.01 else ('**' if r['pval']<0.05 else ('*' if r['pval']<0.1 else ''))
                     if 'fe_beta' in r: cx_b=f"{r['fe_beta']:.4f}{s}"
+                    elif 'iv_beta' in r: cx_b=f"{r['iv_beta']:.4f}{s}"
                     elif 'ols_params' in r and len(r['ols_params'])>1:
                         pk=list(r['ols_params'].keys())[1]; cx_b=f"{r['ols_params'][pk]['b']:.4f}{s}"
                     tbl.append({'#':i+1,'控制组合':cs,'β(SE)':cx_b,'|t|':f"{abs(r['tstat']):.2f}",
@@ -1952,33 +2009,69 @@ if st.session_state.df is not None:
                     except Exception as e: st.error(f"PSM-DID 失败：{e}")
 
                 elif 'RDD' in model_sel:
-                    td=sub[[y_col]+Xv0].dropna(); Xd=sm.add_constant(td[Xv0])
-                    m=OLS(td[y_col].values,Xd).fit(cov_type='HC1')
-                    label_map={'_rdd_treat':'断点处理项','_rdd_running_c':'断点距离','_rdd_inter':'断点两侧斜率差','_rdd_running_c2':'断点距离²','_rdd_inter2':'二阶斜率差'}
-                    rows=[]
-                    for j,vn in enumerate(['const']+Xv0):
-                        b=m.params[vn]; se=m.bse[vn]; t=abs(b/se) if se>0 else 0; pv=m.pvalues[vn]
-                        s='***' if pv<0.01 else ('**' if pv<0.05 else ('*' if pv<0.1 else ''))
-                        rows.append({'变量':label_map.get(vn,vn),'系数':f"{b:.4f}{s}",'SE':f"({se:.4f})",'t':f"{t:.2f}",'p':f"{pv:.4f}"})
-                    st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
                     bw_note='全样本' if not rdd_bandwidth else f'|running-cutoff|≤{rdd_bandwidth}'
-                    st.caption(f"RDD（Sharp）｜断点变量={rdd_running}｜cutoff={rdd_cutoff}｜{bw_note}｜N={len(td)}｜R²={m.rsquared:.4f}")
-                    rdd_ctrls=[v for v in Xv0 if v!='_rdd_treat']
-                    do=f"* === 鹈鹕回归 (c)2026 · 仅供参考 · 不构成统计建议 ===\n* RDD: {y_col} around cutoff {rdd_cutoff}\n\nuse \"data.dta\", clear\n"
-                    do+=f"gen rdd_running_c={rdd_running}-{rdd_cutoff}\ngen rdd_treat=({rdd_running}>={rdd_cutoff})\ngen rdd_inter=rdd_treat*rdd_running_c\n"
-                    if '二阶' in rdd_order:
-                        do+="gen rdd_running_c2=rdd_running_c^2\ngen rdd_inter2=rdd_treat*rdd_running_c2\n"
-                    if rdd_bandwidth and rdd_bandwidth>0:
-                        do+=f"keep if abs(rdd_running_c)<={rdd_bandwidth}\n"
-                    stata_vars='rdd_treat rdd_running_c rdd_inter'
-                    if '二阶' in rdd_order: stata_vars+=' rdd_running_c2 rdd_inter2'
-                    user_ctrls=[v for v in rdd_ctrls if not v.startswith('_rdd_')]
-                    if user_ctrls: stata_vars+=' '+' '.join(user_ctrls)
-                    do+=f"reg {y_col} {stata_vars}, robust\n"
+                    label_map={'_rdd_treat':'断点处理项','_rdd_z':'断点工具变量 Z','_rdd_running_c':'断点距离','_rdd_inter':'断点两侧斜率差','_rdd_running_c2':'断点距离²','_rdd_inter2':'二阶斜率差'}
+                    if rdd_design.startswith('Fuzzy'):
+                        rdd_ctrls=[v for v in Xv0 if v!=rdd_treatment]
+                        exog_vars=[v for v in rdd_ctrls if v in sub.columns and v!='_rdd_z']
+                        td=sub[[y_col,rdd_treatment,'_rdd_z']+exog_vars].replace([np.inf,-np.inf],np.nan).dropna()
+                        exog=sm.add_constant(td[exog_vars]) if exog_vars else sm.add_constant(pd.DataFrame(index=td.index))
+                        iv_m=IV2SLS(td[y_col],exog,td[[rdd_treatment]],td[['_rdd_z']]).fit(cov_type='robust')
+                        fs=OLS(td[rdd_treatment],sm.add_constant(td[exog_vars+['_rdd_z']])).fit(cov_type='HC1')
+                        rf=OLS(td[y_col],sm.add_constant(td[exog_vars+['_rdd_z']])).fit(cov_type='HC1')
+                        b=iv_m.params.get(rdd_treatment,np.nan); se=iv_m.std_errors.get(rdd_treatment,np.nan); pv=iv_m.pvalues.get(rdd_treatment,np.nan)
+                        fs_b=fs.params.get('_rdd_z',np.nan); fs_p=fs.pvalues.get('_rdd_z',np.nan)
+                        rf_b=rf.params.get('_rdd_z',np.nan); rf_p=rf.pvalues.get('_rdd_z',np.nan)
+                        rows=[
+                            {'估计量':'LATE / 2SLS','变量':rdd_treatment,'系数':f"{b:.4f}",'SE':f"({se:.4f})",'p':f"{pv:.4f}"},
+                            {'估计量':'第一阶段跳跃','变量':'Z → D','系数':f"{fs_b:.4f}",'SE':f"({fs.bse.get('_rdd_z',np.nan):.4f})",'p':f"{fs_p:.4f}"},
+                            {'估计量':'简化式跳跃','变量':'Z → Y','系数':f"{rf_b:.4f}",'SE':f"({rf.bse.get('_rdd_z',np.nan):.4f})",'p':f"{rf_p:.4f}"}
+                        ]
+                        st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
+                        side_counts=td['_rdd_z'].value_counts()
+                        st.caption(f"Fuzzy RD｜断点变量={rdd_running}｜cutoff={rdd_cutoff}｜D={rdd_treatment}｜{bw_note}｜左侧/右侧样本={int(side_counts.get(0,0))}/{int(side_counts.get(1,0))}｜N={len(td)}")
+                        user_ctrls=[v for v in exog_vars if not v.startswith('_rdd_')]
+                        do=f"* === 鹈鹕回归 (c)2026 · Fuzzy RD / 2SLS ===\n* LATE: {y_col} <- {rdd_treatment}, instrumented by cutoff Z\n\nuse \"data.dta\", clear\n"
+                        do+=f"gen rdd_running_c={rdd_running}-{rdd_cutoff}\ngen rdd_z=({rdd_running}>={rdd_cutoff})\ngen rdd_inter=rdd_z*rdd_running_c\n"
+                        if '二阶' in rdd_order:
+                            do+="gen rdd_running_c2=rdd_running_c^2\ngen rdd_inter2=rdd_z*rdd_running_c2\n"
+                        if rdd_bandwidth and rdd_bandwidth>0:
+                            do+=f"keep if abs(rdd_running_c)<={rdd_bandwidth}\n"
+                        stata_exog='rdd_running_c rdd_inter'
+                        if '二阶' in rdd_order: stata_exog+=' rdd_running_c2 rdd_inter2'
+                        if user_ctrls: stata_exog+=' '+' '.join(user_ctrls)
+                        do+=f"* 第一阶段\nreg {rdd_treatment} rdd_z {stata_exog}, robust\n"
+                        do+=f"* 简化式\nreg {y_col} rdd_z {stata_exog}, robust\n"
+                        do+=f"* Fuzzy RD: 2SLS / LATE\nivregress 2sls {y_col} {stata_exog} ({rdd_treatment}=rdd_z), robust\nestat firststage\n"
+                        out_csv=pd.DataFrame(rows).to_csv(index=False)
+                    else:
+                        td=sub[[y_col]+Xv0].dropna(); Xd=sm.add_constant(td[Xv0])
+                        m=OLS(td[y_col].values,Xd).fit(cov_type='HC1')
+                        rows=[]
+                        for j,vn in enumerate(['const']+Xv0):
+                            b=m.params[vn]; se=m.bse[vn]; t=abs(b/se) if se>0 else 0; pv=m.pvalues[vn]
+                            s='***' if pv<0.01 else ('**' if pv<0.05 else ('*' if pv<0.1 else ''))
+                            rows.append({'变量':label_map.get(vn,vn),'系数':f"{b:.4f}{s}",'SE':f"({se:.4f})",'t':f"{t:.2f}",'p':f"{pv:.4f}"})
+                        st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
+                        side_counts=td['_rdd_treat'].value_counts()
+                        st.caption(f"Sharp RD｜断点变量={rdd_running}｜cutoff={rdd_cutoff}｜{bw_note}｜左侧/右侧样本={int(side_counts.get(0,0))}/{int(side_counts.get(1,0))}｜N={len(td)}｜R²={m.rsquared:.4f}")
+                        rdd_ctrls=[v for v in Xv0 if v!='_rdd_treat']
+                        do=f"* === 鹈鹕回归 (c)2026 · Sharp RD ===\n* RDD: {y_col} around cutoff {rdd_cutoff}\n\nuse \"data.dta\", clear\n"
+                        do+=f"gen rdd_running_c={rdd_running}-{rdd_cutoff}\ngen rdd_treat=({rdd_running}>={rdd_cutoff})\ngen rdd_inter=rdd_treat*rdd_running_c\n"
+                        if '二阶' in rdd_order:
+                            do+="gen rdd_running_c2=rdd_running_c^2\ngen rdd_inter2=rdd_treat*rdd_running_c2\n"
+                        if rdd_bandwidth and rdd_bandwidth>0:
+                            do+=f"keep if abs(rdd_running_c)<={rdd_bandwidth}\n"
+                        stata_vars='rdd_treat rdd_running_c rdd_inter'
+                        if '二阶' in rdd_order: stata_vars+=' rdd_running_c2 rdd_inter2'
+                        user_ctrls=[v for v in rdd_ctrls if not v.startswith('_rdd_')]
+                        if user_ctrls: stata_vars+=' '+' '.join(user_ctrls)
+                        do+=f"reg {y_col} {stata_vars}, robust\n"
+                        out_csv=pd.DataFrame(rows).to_csv(index=False)
                     with st.expander("Stata 复现代码"): st.code(do,language='stata')
                     dl1,dl2=st.columns(2)
-                    dl1.download_button("下载 .do",do,file_name=f"rdd_{y_col}.do",key=f'dlrdd_{cx}_v1')
-                    dl2.download_button("下载 .csv",pd.DataFrame(rows).to_csv(index=False),file_name=f"rdd_{y_col}.csv",mime="text/csv",key=f'csrdd_{cx}_v1')
+                    dl1.download_button("下载 .do",do,file_name=f"rdd_{y_col}.do",key=f'dlrdd_{cx}_v2')
+                    dl2.download_button("下载 .csv",out_csv,file_name=f"rdd_{y_col}.csv",mime="text/csv",key=f'csrdd_{cx}_v2')
 
                 elif model_sel.startswith('OLS') or 'Pooled' in model_sel:
                     td=sub[[y_col]+Xv0].dropna(); Xd=sm.add_constant(td[Xv0])
