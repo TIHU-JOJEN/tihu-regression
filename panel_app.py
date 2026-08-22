@@ -16,6 +16,8 @@ from scipy.optimize import minimize
 from itertools import combinations
 from sklearn.neighbors import NearestNeighbors
 import time, warnings, traceback
+import base64
+from pathlib import Path
 warnings.filterwarnings('ignore')
 
 st.set_page_config(page_title="鹈鹕回归", layout="wide")
@@ -36,7 +38,16 @@ LEGAL_HEADER = """* ============================================================
 
 """
 
+def asset_data_uri(rel_path):
+    path=Path(__file__).resolve().parent / rel_path
+    try:
+        return "data:image/png;base64," + base64.b64encode(path.read_bytes()).decode("ascii")
+    except Exception:
+        return ""
+
 def render_home_hero():
+    mascot_src=asset_data_uri("assets/tihu-pelican-mascot.png")
+    mascot_html=f'<img class="pelican-mascot" src="{mascot_src}" alt="鹈鹕回归吉祥物">' if mascot_src else ""
     st.markdown(f"""
     <style>
       .main .block-container {{
@@ -93,16 +104,16 @@ def render_home_hero():
       .pelican-mark {{
         width: min(390px, 100%);
         aspect-ratio: 1.42;
-        padding: 22px;
-        border-radius: 16px;
-        background: #ffffff;
-        border: 1px solid #d8e2dd;
-        box-shadow: inset 0 0 0 1px rgba(255,255,255,.75), 0 12px 30px rgba(20,33,29,.08);
+        display: flex;
+        align-items: center;
+        justify-content: center;
       }}
-      .pelican-mark svg {{
+      .pelican-mascot {{
         width: 100%;
-        height: 100%;
+        height: auto;
         display: block;
+        transform: rotate(-2deg);
+        filter: drop-shadow(0 16px 22px rgba(20,33,29,.13));
       }}
       .pelican-flow {{
         background: rgba(255,255,255,.82);
@@ -169,7 +180,6 @@ def render_home_hero():
         }}
         .pelican-mark {{
           width: min(330px, 100%);
-          padding: 18px;
         }}
       }}
     </style>
@@ -184,20 +194,7 @@ def render_home_hero():
         </div>
         <div class="pixel-stage">
           <div class="pelican-mark" aria-label="white pelican">
-            <svg viewBox="0 0 520 365" role="img" aria-hidden="true">
-              <rect x="34" y="294" width="360" height="18" rx="9" fill="#b7d9d6"/>
-              <rect x="78" y="318" width="260" height="10" rx="5" fill="#d5e9e6"/>
-              <path d="M138 196 C130 139 172 93 241 88 C318 82 382 123 401 188 C416 240 372 283 285 291 C208 298 151 263 138 196 Z" fill="#fbf8ee" stroke="#d9d0bd" stroke-width="8"/>
-              <path d="M191 204 C222 158 286 145 343 171 C323 224 277 252 217 245 C204 235 195 222 191 204 Z" fill="#ede4d2" stroke="#d7ccb8" stroke-width="6"/>
-              <path d="M320 130 C326 82 363 47 414 46 C452 46 480 65 489 94 C464 91 437 94 413 106 C382 121 354 139 320 130 Z" fill="#fbf8ee" stroke="#d9d0bd" stroke-width="8"/>
-              <path d="M408 58 C460 56 504 77 514 106 C476 115 433 111 399 95 Z" fill="#f0b42a" stroke="#bf7a1d" stroke-width="7" stroke-linejoin="round"/>
-              <path d="M401 96 C448 104 488 107 514 106 C487 130 445 135 407 121 Z" fill="#e29525" stroke="#bf7a1d" stroke-width="6" stroke-linejoin="round"/>
-              <circle cx="420" cy="76" r="6" fill="#1b211f"/>
-              <path d="M264 286 L254 326" stroke="#8a5628" stroke-width="10" stroke-linecap="round"/>
-              <path d="M312 284 L322 326" stroke="#8a5628" stroke-width="10" stroke-linecap="round"/>
-              <path d="M233 329 H275" stroke="#8a5628" stroke-width="9" stroke-linecap="round"/>
-              <path d="M303 329 H346" stroke="#8a5628" stroke-width="9" stroke-linecap="round"/>
-            </svg>
+            {mascot_html}
           </div>
         </div>
       </div>
