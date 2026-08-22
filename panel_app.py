@@ -46,7 +46,7 @@ def asset_data_uri(rel_path):
         return ""
 
 def render_home_hero():
-    mascot_src=asset_data_uri("assets/tihu-pelican-mascot.png")
+    mascot_src=asset_data_uri("assets/tihu-pelican-line-45.png")
     mascot_html=f'<img class="pelican-mascot" src="{mascot_src}" alt="鹈鹕回归吉祥物">' if mascot_src else ""
     st.markdown(f"""
     <style>
@@ -102,18 +102,18 @@ def render_home_hero():
         align-items: center;
       }}
       .pelican-mark {{
-        width: min(390px, 100%);
-        aspect-ratio: 1.42;
+        width: min(430px, 100%);
+        height: 270px;
         display: flex;
         align-items: center;
-        justify-content: center;
+        justify-content: flex-start;
       }}
       .pelican-mascot {{
-        width: 100%;
-        height: auto;
+        width: auto;
+        max-width: 100%;
+        max-height: 100%;
         display: block;
-        transform: rotate(-2deg);
-        filter: drop-shadow(0 16px 22px rgba(20,33,29,.13));
+        filter: drop-shadow(0 14px 16px rgba(20,33,29,.08));
       }}
       .pelican-flow {{
         background: rgba(255,255,255,.82);
@@ -180,6 +180,7 @@ def render_home_hero():
         }}
         .pelican-mark {{
           width: min(330px, 100%);
+          height: 230px;
         }}
       }}
     </style>
