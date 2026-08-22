@@ -36,8 +36,211 @@ LEGAL_HEADER = """* ============================================================
 
 """
 
-st.title("鹈鹕回归")
-st.caption("面板 FE/RE/DID · 横截面 OLS/Logit/Tobit/有序/Poisson/Heckman/PSM/IV · 时间序列 ARIMA/VAR")
+def render_home_hero():
+    art = [
+        "................",
+        ".....bbbb.......",
+        "....bbbbbb......",
+        "...bbbbbbee.....",
+        "..bbbbbbbeee....",
+        "..bbbbbbbeeeo...",
+        "...bbbbbbbeeo...",
+        "....bbbbbb......",
+        ".....bbbbyy.....",
+        "......bbyyy.....",
+        ".......yyyy.....",
+        ".......y..y.....",
+        "......y....y....",
+        "................",
+    ]
+    classes = {'.':'empty','b':'body','e':'beak','o':'eye','y':'leg'}
+    cells = ''.join(f'<span class="px {classes[ch]}"></span>' for row in art for ch in row)
+    st.markdown(f"""
+    <style>
+      .main .block-container {{
+        padding-top: 1.6rem;
+      }}
+      .pelican-hero {{
+        display: grid;
+        grid-template-columns: minmax(280px, 1.08fr) minmax(320px, .92fr);
+        gap: 34px;
+        align-items: stretch;
+        min-height: 430px;
+        margin: 0 0 28px 0;
+        padding: 34px;
+        border: 1px solid #dfe7e2;
+        border-radius: 18px;
+        background:
+          linear-gradient(135deg, rgba(11, 107, 110, .08), rgba(238, 107, 91, .06) 46%, rgba(255,255,255,.94)),
+          #fbfcfa;
+        box-shadow: 0 18px 45px rgba(28, 45, 38, .08);
+      }}
+      .pelican-brand {{
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        min-width: 0;
+      }}
+      .pelican-kicker {{
+        font-size: 14px;
+        color: #0b6b6e;
+        font-weight: 700;
+        letter-spacing: 0;
+        margin-bottom: 12px;
+      }}
+      .pelican-title {{
+        font-size: clamp(52px, 7vw, 92px);
+        line-height: .98;
+        letter-spacing: 0;
+        color: #14211d;
+        font-weight: 900;
+        margin: 0;
+      }}
+      .pelican-subtitle {{
+        margin-top: 18px;
+        max-width: 650px;
+        color: #4e5d57;
+        font-size: 18px;
+        line-height: 1.7;
+      }}
+      .pixel-stage {{
+        margin-top: 28px;
+        display: flex;
+        align-items: end;
+        gap: 20px;
+      }}
+      .pixel-pelican {{
+        display: grid;
+        grid-template-columns: repeat(16, 15px);
+        grid-auto-rows: 15px;
+        gap: 3px;
+        padding: 18px;
+        border-radius: 14px;
+        background: #ffffff;
+        border: 1px solid #d8e2dd;
+        box-shadow: inset 0 0 0 1px rgba(255,255,255,.75), 0 12px 30px rgba(20,33,29,.08);
+      }}
+      .px {{
+        width: 15px;
+        height: 15px;
+        border-radius: 3px;
+      }}
+      .px.empty {{ background: transparent; }}
+      .px.body {{ background: #0b6b6e; }}
+      .px.beak {{ background: #ee6b5b; }}
+      .px.eye {{ background: #17211d; }}
+      .px.leg {{ background: #e0a72e; }}
+      .pixel-caption {{
+        max-width: 220px;
+        color: #627069;
+        font-size: 14px;
+        line-height: 1.55;
+      }}
+      .pelican-flow {{
+        background: rgba(255,255,255,.82);
+        border: 1px solid #dfe7e2;
+        border-radius: 16px;
+        padding: 26px;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+      }}
+      .flow-title {{
+        color: #14211d;
+        font-size: 24px;
+        font-weight: 850;
+        margin-bottom: 18px;
+      }}
+      .flow-list {{
+        display: grid;
+        gap: 12px;
+      }}
+      .flow-item {{
+        display: grid;
+        grid-template-columns: 46px 1fr;
+        gap: 14px;
+        align-items: center;
+        padding: 12px 0;
+        border-bottom: 1px solid #e6ece8;
+      }}
+      .flow-item:last-child {{ border-bottom: 0; }}
+      .flow-num {{
+        width: 40px;
+        height: 40px;
+        border-radius: 12px;
+        display: grid;
+        place-items: center;
+        font-weight: 850;
+        color: #ffffff;
+        background: #14211d;
+      }}
+      .flow-item:nth-child(2) .flow-num {{ background: #0b6b6e; }}
+      .flow-item:nth-child(3) .flow-num {{ background: #5d6b32; }}
+      .flow-item:nth-child(4) .flow-num {{ background: #7a4f20; }}
+      .flow-item:nth-child(5) .flow-num {{ background: #b64d3e; }}
+      .flow-item:nth-child(6) .flow-num {{ background: #324b7a; }}
+      .flow-copy {{
+        color: #24322d;
+        font-size: 17px;
+        font-weight: 720;
+        line-height: 1.45;
+      }}
+      .flow-note {{
+        margin-top: 20px;
+        color: #63726b;
+        font-size: 14px;
+        line-height: 1.6;
+      }}
+      @media (max-width: 900px) {{
+        .pelican-hero {{
+          grid-template-columns: 1fr;
+          padding: 24px;
+        }}
+        .pixel-stage {{
+          flex-direction: column;
+          align-items: start;
+        }}
+        .pixel-pelican {{
+          grid-template-columns: repeat(16, 12px);
+          grid-auto-rows: 12px;
+          gap: 2px;
+        }}
+        .px {{
+          width: 12px;
+          height: 12px;
+        }}
+      }}
+    </style>
+    <section class="pelican-hero">
+      <div class="pelican-brand">
+        <div>
+          <div class="pelican-kicker">计量实证流程辅助工具</div>
+          <h1 class="pelican-title">鹈鹕回归</h1>
+          <div class="pelican-subtitle">
+            面向论文实证与数据分析场景，把清洗、变量加工、模型选择、显著性搜寻和可复现代码组织成一条连续工作流。
+          </div>
+        </div>
+        <div class="pixel-stage">
+          <div class="pixel-pelican" aria-label="abstract pixel pelican">{cells}</div>
+          <div class="pixel-caption">抽象几何像素鹈鹕：轻量、稳定，不依赖外部图片资源。</div>
+        </div>
+      </div>
+      <div class="pelican-flow">
+        <div class="flow-title">产品功能流程</div>
+        <div class="flow-list">
+          <div class="flow-item"><div class="flow-num">01</div><div class="flow-copy">上传数据</div></div>
+          <div class="flow-item"><div class="flow-num">02</div><div class="flow-copy">清洗数据</div></div>
+          <div class="flow-item"><div class="flow-num">03</div><div class="flow-copy">分析数据类型</div></div>
+          <div class="flow-item"><div class="flow-num">04</div><div class="flow-copy">推荐和选择模型</div></div>
+          <div class="flow-item"><div class="flow-num">05</div><div class="flow-copy">全流程显著实证搜寻</div></div>
+          <div class="flow-item"><div class="flow-num">06</div><div class="flow-copy">自动生成可复现 Stata 代码</div></div>
+        </div>
+        <div class="flow-note">从这里开始，下面直接进入数据上传与实证流程。</div>
+      </div>
+    </section>
+    """, unsafe_allow_html=True)
+
+render_home_hero()
 
 # ── 侧边栏：法律声明 ──
 with st.sidebar:
