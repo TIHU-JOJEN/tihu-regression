@@ -40,6 +40,55 @@ def infer_type(values):
     return "连续"
 
 
+def esr_identification_candidates(data, y, treatment, candidates, alpha=.10):
+    """Screen observable relevance and a no-direct-effect exclusion proxy."""
+    columns = ["变量", "相关性 p值", "排他性代理 p值", "有效样本"]
+    if not binary(data[treatment]):
+        return pd.DataFrame(columns=columns)
+
+    def joint_p(result, terms):
+        if len(terms) == 1:
+            return float(result.pvalues[terms[0]])
+        restriction = np.zeros((len(terms), len(result.params)))
+        positions = {name: i for i, name in enumerate(result.params.index)}
+        for row, term in enumerate(terms):
+            restriction[row, positions[term]] = 1
+        return float(np.asarray(result.wald_test(restriction, scalar=True).pvalue).item())
+
+    rows = []
+    for candidate in unique(candidates):
+        nuisance = []
+        for column in unique(candidates):
+            if column == candidate:
+                continue
+            values = data[column].dropna()
+            if pd.api.types.is_numeric_dtype(data[column]) or values.nunique() <= 10:
+                nuisance.append(column)
+            if len(nuisance) == 20:
+                break
+        d = data[unique([y, treatment, candidate]+nuisance)].dropna()
+        if len(d) < 30 or d[candidate].nunique() < 2:
+            continue
+        try:
+            candidate_x = design(d, [candidate])
+            candidate_terms = [c for c in candidate_x if c != "const"]
+            first_x = design(d, [candidate]+nuisance)
+            first = sm.OLS(d[treatment].astype(float), first_x).fit(cov_type="HC1")
+            relevance_p = joint_p(first, candidate_terms)
+
+            outcome_x = design(d, [treatment, candidate]+nuisance)
+            direct_terms = candidate_terms
+            outcome = sm.OLS(d[y].astype(float), outcome_x).fit(cov_type="HC1")
+            exclusion_p = joint_p(outcome, direct_terms)
+        except (ValueError, np.linalg.LinAlgError, ZeroDivisionError):
+            continue
+        if np.isfinite([relevance_p, exclusion_p]).all() and relevance_p < alpha <= exclusion_p:
+            rows.append({"变量": candidate, "相关性 p值": relevance_p, "排他性代理 p值": exclusion_p, "有效样本": len(d)})
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(rows).sort_values(["相关性 p值", "排他性代理 p值"], ascending=[True, False])
+
+
 def validate_panel(df, entity, time):
     if not entity or not time or entity == time:
         raise ValueError("请选择不同的个体和时间列")
@@ -628,7 +677,15 @@ def candidate_specs(base, pool, minimum, maximum, limit=500, seed=42, joint=True
             if counter in positions:
                 cores = [base.core] if joint or len(base.core) <= 1 else [[v] for v in base.core]
                 for core in cores:
-                    yield replace(base, core=core, controls=unique(base.controls+list(combo)))
+                    candidate = replace(base, core=core, controls=unique(base.controls+list(combo)))
+                    if candidate.model == "ESR" and candidate.instruments:
+                        candidate = replace(
+                            candidate,
+                            selection=unique(candidate.controls+candidate.instruments),
+                            regime0=[],
+                            regime1=[],
+                        )
+                    yield candidate
             counter += 1
 
 

@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 from tihu_core import *
-from tihu_export import reproducibility_bundle
+from tihu_export import reproducibility_bundle, stata_model, stata_script
 
 
 def cross(n=240, seed=42):
@@ -68,19 +68,24 @@ from tihu_ui import render_workbench
 st.set_page_config(layout="wide")
 rng=np.random.default_rng(31); n=500
 x,z,u,e0,e1=rng.normal(size=(5,n)); D=(z+.4*x+u>0).astype(int)
-df=pd.DataFrame({"y":np.where(D,3+.7*x+.35*u+e1,1+.7*x+.35*u+e0),"x":x,"z":z,"m":e0,"D":D})
+df=pd.DataFrame({"y":np.where(D,3+.7*x+e1,1+.7*x+e0),"x":x,"z":z,"m":e0,"D":D})
 upload=BytesIO(df.to_csv(index=False).encode()); upload.name="esr.csv"
 with patch("streamlit.file_uploader", side_effect=lambda *a, **kw: upload if kw.get("key")=="data_upload" else None): render_workbench()
 '''
         a = AppTest.from_string(script, default_timeout=60).run()
         a.selectbox(key="cfg_model").select("ESR").run()
+        a.selectbox(key="cfg_esr_exclusion").select("z").run()
         a.multiselect(key="cfg_controls").set_value(["x"]).run()
-        a.multiselect(key="cfg_selection").set_value(["x", "z"]).run()
         a.button(key="run_search").click().run(timeout=60)
         self.assertEqual(list(a.exception), [])
         fits = a.session_state["workspace_v2"]["fits"]
         self.assertEqual(len(fits), 1)
         self.assertEqual(fits[0].effect["term"], "ATT")
+        self.assertEqual(fits[0].spec.controls, ["x"])
+        self.assertEqual(fits[0].spec.selection, ["x", "z"])
+        self.assertEqual(fits[0].spec.regime0, [])
+        self.assertEqual(fits[0].spec.regime1, [])
+        self.assertIn("Stata 复现代码", [item.label for item in a.expander])
         self.assertEqual([tab.label for tab in a.tabs[-4:]], ["机制 / 中介", "调节", "异质性", "稳健性"])
 
     def test_pipeline(self):
@@ -173,12 +178,39 @@ with patch("streamlit.file_uploader", side_effect=lambda *a, **kw: upload if kw.
         effects = r.details["effects"].set_index("term").coef
         self.assertAlmostEqual(effects.ATT, effects["E[Y1|D=1]"]-effects["E[Y0|D=1]"], places=10)
 
+    def test_esr_candidate_controls_enter_all_equations(self):
+        base = ModelSpec("ESR", "y", controls=["x"], treatment="D", instruments=["z"], selection=["x", "z"])
+        specs = list(candidate_specs(base, ["c"], 0, 1, 10))
+        self.assertEqual(len(specs), 2)
+        for spec in specs:
+            self.assertEqual(spec.selection, spec.controls+["z"])
+            self.assertEqual(spec.regime0, [])
+            self.assertEqual(spec.regime1, [])
+        final = specs[-1]
+        names = {c: c for c in ["y", "D", "x", "c", "z"]}
+        commands = "\n".join(stata_model(Fit(final, None, None, None), names))
+        self.assertIn("(selection: D = x c z)", commands)
+        self.assertIn("(regime0: y = x c)", commands)
+        self.assertIn("(regime1: y = x c)", commands)
+
+    def test_esr_identification_screen(self):
+        rng = np.random.default_rng(9)
+        n = 1200
+        z, bad, noise = rng.normal(size=(3, n))
+        d = (1.2*z+rng.normal(size=n) > 0).astype(int)
+        y = 2*d+1.5*bad+noise
+        data = pd.DataFrame({"y": y, "D": d, "z": z, "bad": bad, "noise": rng.normal(size=n)})
+        screened = esr_identification_candidates(data, "y", "D", ["z", "bad", "noise"])
+        self.assertEqual(screened["变量"].tolist(), ["z"])
+
     def test_config_and_bundle(self):
         raw = cross()
         steps = [{"op": "square", "cols": ["x"], "name": "x_sq"}]
         data, _ = apply_steps(raw, steps)
         fit = fit_model(data, ModelSpec("OLS", "y", ["x"], ["x_sq"], se="ordinary"))
         packed, do = reproducibility_bundle(raw, steps, fit, "hash")
+        script, _ = stata_script(raw, steps, fit)
+        self.assertEqual(script, do)
         with zipfile.ZipFile(io.BytesIO(packed)) as z:
             self.assertEqual(len(pd.read_stata(io.BytesIO(z.read("source.dta")))), len(raw))
             self.assertIn("replay.py", z.namelist())

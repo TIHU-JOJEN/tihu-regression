@@ -12,10 +12,11 @@ import statsmodels.api as sm
 
 from tihu_core import (VERSION, ModelSpec, apply_steps, binary, candidate_specs,
                        config_payload, fingerprint, fit_model, fixed_sample,
-                       grouped_moderation, infer_type, load_config, mechanism_analysis,
+                       grouped_moderation, infer_type, esr_identification_candidates,
+                       load_config, mechanism_analysis,
                        mediation_bootstrap, rank_fit, required_columns, unique,
                        validate_panel)
-from tihu_export import dta_bytes, reproducibility_bundle
+from tihu_export import dta_bytes, reproducibility_bundle, stata_script
 
 
 def invalidate(ws):
@@ -55,6 +56,11 @@ def display_table(table):
     if "p 值" in renamed:
         renamed["显著性"] = renamed["p 值"].map(lambda p: "***" if p < .01 else ("**" if p < .05 else ("*" if p < .1 else "")))
     st.dataframe(renamed, width="stretch", hide_index=True, column_config={c: st.column_config.NumberColumn(format="%.6f") for c in ["系数", "标准误", "p 值", "95%下限", "95%上限"]})
+
+
+@st.cache_data(show_spinner=False)
+def cached_esr_identification_candidates(data, y, treatment, candidates):
+    return esr_identification_candidates(data, y, treatment, candidates)
 
 
 def pipeline_panel(ws, raw):
@@ -258,6 +264,29 @@ def specification(data):
         if not s.treatment:
             st.warning("请先将处理/选择变量明确编码为 0/1")
             return None
+    if model == "ESR":
+        screened = cached_esr_identification_candidates(
+            data,
+            y,
+            s.treatment,
+            tuple(c for c in other if c != s.treatment),
+        )
+        eligible = screened["变量"].tolist()
+        if not eligible:
+            st.warning("没有变量同时通过识别变量筛选：与 D 相关 p<0.10，控制 D 后对 Y 的直接关系 p≥0.10。")
+            return None
+        exclusion = choose(
+            "识别变量 Z（仅进入选择方程）",
+            eligible,
+            "cfg_esr_exclusion",
+        )
+        if not exclusion:
+            st.warning("ESR 需要先选择一个识别变量")
+            return None
+        s.instruments = [exclusion]
+        with st.expander("识别变量筛选结果"):
+            st.dataframe(screened, hide_index=True, width="stretch")
+            st.caption("相关性使用稳健标准误的一阶段线性概率检验；排他性使用控制 D 后的无直接关系代理检验。")
     if "DID" in model:
         post_mode = choose("Post 来源", ["政策时间", "已有 Post"], "cfg_post_mode")
         if post_mode == "已有 Post":
@@ -293,17 +322,13 @@ def specification(data):
     control_options = [c for c in selectable if c not in s.core+s.instruments]
     s.controls = multiple("必选控制变量", control_options, "cfg_controls")
     pool = multiple("候选控制变量", [c for c in control_options if c not in s.controls], "cfg_pool")
-    if model in {"ESR", "Heckman"}:
+    if model == "ESR":
+        s.selection = unique(s.controls+s.instruments)
+        s.effect = choose("搜索效应", ["ATT", "ATU"], "cfg_effect")
+        st.caption("每个控制变量组合同时进入 D=0、D=1 结果方程和选择方程；识别变量 Z 只进入选择方程。")
+    elif model == "Heckman":
         selection_options = [c for c in other if c != s.treatment]
         s.selection = multiple("选择方程变量（含你指定的排除变量）", selection_options, "cfg_selection", s.controls)
-        if model == "ESR":
-            s.effect = choose("搜索效应", ["ATT", "ATU"], "cfg_effect")
-            if st.checkbox("分别配置两组结果方程", key="cfg_separate_regimes"):
-                s.regime0 = multiple("D=0 结果方程变量", control_options, "cfg_regime0", s.controls)
-                s.regime1 = multiple("D=1 结果方程变量", control_options, "cfg_regime1", s.controls)
-                if pool:
-                    st.info("分别配置结果方程时，候选控制组合同时加入两组")
-            st.caption("选择方程固定；搜索所选平均处理效应。两组结果方程按选择状态分别估计。")
     if model == "Tobit":
         boundary = choose("审查边界", ["下界", "上界", "双侧"], "cfg_boundary")
         if boundary in {"下界", "双侧"}:
@@ -375,6 +400,8 @@ def search_controls(ws, data, s, pool):
     active = job and not job["done"]
     if st.button("开始估计" if not pool else "开始搜索", type="primary", disabled=bool(active), key="run_search"):
         try:
+            if s.model == "ESR" and not s.instruments:
+                raise ValueError("请选择识别变量 Z")
             if s.model in {"ESR", "Heckman"} and not s.selection:
                 raise ValueError("请选择选择方程变量")
             if s.model == "IV/2SLS" and (not s.core or not s.instruments):
@@ -382,8 +409,6 @@ def search_controls(ws, data, s, pool):
             specs = list(candidate_specs(s, pool, minimum, maximum, budget, joint=joint))
             if not specs:
                 raise ValueError("没有可运行组合，请调整候选控制数")
-            if s.model == "ESR" and (s.regime0 or s.regime1):
-                specs = [replace(v, regime0=unique(s.regime0+v.controls), regime1=unique(s.regime1+v.controls)) for v in specs]
             search_data = fixed_sample(data, s, pool) if sample_mode.startswith("固定") else data.copy()
             invalidate(ws)
             ws["job"] = {"data": search_data, "specs": specs, "index": 0, "fits": [], "failures": {}, "joint": joint, "done": False, "signature": json.dumps(asdict(s), sort_keys=True, default=str)}
@@ -561,6 +586,12 @@ def results_ui(ws, raw):
             display_table(value) if "term" in value else st.dataframe(value, width="stretch")
         elif key not in {"pairs", "ps"}:
             st.caption(f"{key}: {value}")
+    try:
+        do, _ = stata_script(raw, ws.get("steps", []), fit)
+        with st.expander("Stata 复现代码"):
+            st.code(do, language="stata")
+    except Exception as e:
+        st.warning(f"Stata 代码暂时无法生成：{e}")
     if st.button("生成完整复现文件包", icon=":material/download:", key="build_bundle"):
         try:
             ws["bundle"] = reproducibility_bundle(raw, ws.get("steps", []), fit, ws["hash"])
@@ -570,8 +601,6 @@ def results_ui(ws, raw):
         bundle, do = ws["bundle"]
         st.download_button("下载复现包（包含本次数据）", bundle, "tihu_reproducible.zip", mime="application/zip", key="download_bundle")
         st.download_button("下载 Stata .do", do, "analysis.do", key="download_do")
-        with st.expander("Stata 代码"):
-            st.code(do, language="stata")
     with st.expander("对比多个结果"):
         selected = st.multiselect("结果编号", range(len(fits)), format_func=lambda i: str(i+1), key="compare_results")
         if selected:

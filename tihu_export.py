@@ -176,13 +176,10 @@ def stata_model(fit, names):
     return lines
 
 
-def reproducibility_bundle(raw, steps, fit, file_hash):
+def stata_script(raw, steps, fit):
     processed, _ = apply_steps(raw, steps)
     cols = unique(list(raw.columns)+list(processed.columns))
     names = {c: f"v{i+1:04d}" for i, c in enumerate(cols)}
-    source = raw.rename(columns=names).copy()
-    source["__rowid"] = raw.index.to_numpy(dtype=int)
-    selected = pd.DataFrame({"__rowid": fit.sample.index.to_numpy(dtype=int)})
     categorical = [c for c in fit.spec.categorical if c in processed]
     lines = ["version 16", "clear all", "set more off", "set seed 42", "* Run from the extracted bundle directory."]
     lines += stata_pipeline(raw, steps, names)
@@ -198,12 +195,21 @@ def reproducibility_bundle(raw, steps, fit, file_hash):
         else:
             lines += [f"encode {names[c]}, gen(__encoded{i})", f"drop {names[c]}", f"rename __encoded{i} {names[c]}"]
     lines += stata_model(fit, names)
+    return "\n".join(lines), names
+
+
+def reproducibility_bundle(raw, steps, fit, file_hash):
+    processed, _ = apply_steps(raw, steps)
+    do, names = stata_script(raw, steps, fit)
+    source = raw.rename(columns=names).copy()
+    source["__rowid"] = raw.index.to_numpy(dtype=int)
+    selected = pd.DataFrame({"__rowid": fit.sample.index.to_numpy(dtype=int)})
     manifest = {"version": VERSION, "file_hash": file_hash, "steps": steps, "spec": asdict(fit.spec), "column_names": names, "sample_rows": fit.sample.index.tolist()}
     out = BytesIO()
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("source.dta", dta_bytes(source))
         z.writestr("sample.dta", dta_bytes(selected))
-        z.writestr("analysis.do", "\n".join(lines)+"\n")
+        z.writestr("analysis.do", do+"\n")
         z.writestr("result.csv", fit.table.to_csv(index=False))
         if "effects" in fit.details:
             z.writestr("effects.csv", fit.details["effects"].to_csv(index=False))
@@ -230,4 +236,4 @@ print(result.effect)
         packages = ["streamlit", "pandas", "numpy", "statsmodels", "linearmodels", "scipy", "scikit-learn", "openpyxl"]
         z.writestr("requirements.txt", "\n".join(f"{package}=={importlib.metadata.version(package)}" for package in packages)+"\n")
         z.writestr("README.txt", "此文件包包含本次原始数据，请自行保管。\nanalysis.do: 在 Stata 中将工作目录切换到解压目录后运行。\nsource.dta: 原始数据；sample.dta: 选定估计样本行号。\n清洗及变量加工在 analysis.do 中重做；匹配结果使用本次固定匹配样本。\nreplay.py: 使用相同 Python 依赖重新计算。\n网页与 Stata 的有限样本标准误修正可能存在差异；未经 Stata 实机数值验收的模型不能保证逐位一致。\nESR 使用完整联合似然，ATT/ATU 对固定协变量样本采用 Delta 法。\n")
-    return out.getvalue(), "\n".join(lines)
+    return out.getvalue(), do
