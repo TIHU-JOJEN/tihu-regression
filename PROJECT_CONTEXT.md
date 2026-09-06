@@ -26,7 +26,7 @@ Streamlit Community Cloud 从仓库根目录运行 `panel_app.py`。更新依赖
 ## 模型范围
 
 - 横截面：OLS、Logit/Probit/LPM、有序模型、Poisson/负二项、Tobit、Heckman、PSM、IV/2SLS、Sharp/Fuzzy RD、ANOVA/交互效应、ESR。
-- 面板：FE、RE、FE+RE、Pooled OLS、DID、PSM-DID，以及适合结果类型的基础模型。
+- 面板：FE、RE、FE+RE、Pooled OLS、DID、PSM-DID，以及适合结果类型的基础模型。FE 可分别选择个体固定效应、时间固定效应或双向固定效应；DID 始终保留个体固定效应。
 - 时间序列：ARIMA、AR、MA、ARMA、VAR、GARCH，并提供动态机制和调节分析。
 - ESR 首版范围：横截面、连续 Y、0/1 选择变量。识别变量列表仅显示同时通过相关性检验和无直接关系代理检验的变量；每个候选控制组合同时进入两个结果方程和选择方程，识别变量仅进入选择方程。网页与导出的 Stata 代码均使用同一高斯完整信息最大似然；ATT/ATU 使用 Delta 法。
 

@@ -120,7 +120,7 @@ def stata_model(fit, names):
         if s.model == "RE":
             lines += [f"xtreg {y} {rhs}, re {vce}"]
         else:
-            absorb = f"__panel {n(s.time)}" if s.time_effects else "__panel"
+            absorb = " ".join((["__panel"] if s.entity_effects else [])+([n(s.time)] if s.time_effects else []))
             lines += ["capture which reghdfe", "if _rc ssc install reghdfe", f"reghdfe {y} {rhs}, absorb({absorb}) keepsingletons {vce}"]
             if s.model == "FE+RE":
                 lines += [f"xtreg {y} {rhs}, re {vce}"]

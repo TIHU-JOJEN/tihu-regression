@@ -197,6 +197,7 @@ class ModelSpec:
     cluster: str = ""
     entity: str = ""
     time: str = ""
+    entity_effects: bool = True
     time_effects: bool = True
     treatment: str = ""
     post: str = ""
@@ -536,8 +537,12 @@ def fit_model(data, spec):
             if s.model == "RE":
                 r = RandomEffects(d[s.y], x).fit(**kw)
             else:
+                if not s.entity_effects and not s.time_effects:
+                    raise ValueError("FE 至少需要一种固定效应")
+                if s.model == "FE+RE" and not s.entity_effects:
+                    raise ValueError("FE+RE 比较需要启用个体固定效应")
                 fe_options = {"auto_df": False, "count_effects": False} if s.se == "cluster" else {}
-                r = PanelOLS(d[s.y], x, entity_effects=True, time_effects=s.time_effects, drop_absorbed=True).fit(**kw, **fe_options)
+                r = PanelOLS(d[s.y], x, entity_effects=s.entity_effects, time_effects=s.time_effects, drop_absorbed=True).fit(**kw, **fe_options)
                 if s.model == "FE+RE":
                     re = RandomEffects(d[s.y], x).fit(**kw)
                     details["RE"] = table_from_result(re)
@@ -552,7 +557,8 @@ def fit_model(data, spec):
             table = table_from_result(r)
             if s.se == "cluster" and s.model != "RE":
                 nonnested = 0
-                for effect in [s.entity]+([s.time] if s.time_effects else []):
+                effects = ([s.entity] if s.entity_effects else [])+([s.time] if s.time_effects else [])
+                for effect in effects:
                     if original.groupby(effect)[s.cluster].nunique().max() > 1:
                         nonnested += original[effect].nunique()-1
                 denominator = len(d)-len(r.params)-nonnested
@@ -843,7 +849,7 @@ def load_config(content, file_hash):
         raise ValueError("项目操作超过 100 步")
     numeric_keys = {"cfg_policy", "cfg_cutoff", "cfg_bandwidth", "cfg_degree", "cfg_left", "cfg_right", "cfg_caliper", "cfg_min", "cfg_max", "cfg_budget"}
     list_keys = {"cfg_categorical", "cfg_core", "cfg_instruments", "cfg_controls", "cfg_pool", "cfg_selection", "cfg_regime0", "cfg_regime1", "cfg_ts_exog"}
-    bool_keys = {"cfg_time_effects", "cfg_separate_regimes"}
+    bool_keys = {"cfg_entity_effects", "cfg_time_effects", "cfg_separate_regimes"}
     for key, value in obj["settings"].items():
         if key in numeric_keys and (not isinstance(value, (int, float)) or not math.isfinite(value)):
             raise ValueError("项目的数值设定无效")

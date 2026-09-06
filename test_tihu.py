@@ -132,6 +132,26 @@ with patch("streamlit.file_uploader", side_effect=lambda *a, **kw: upload if kw.
         with self.assertRaises(ValueError):
             validate_panel(bad, "id", "year")
 
+    def test_fe_effect_dimensions(self):
+        d = panel()
+        names = {c: c for c in d.columns}
+        for entity_effects, time_effects, absorb in [
+            (True, False, "absorb(__panel)"),
+            (False, True, "absorb(year)"),
+            (True, True, "absorb(__panel year)"),
+        ]:
+            with self.subTest(entity=entity_effects, time=time_effects):
+                spec = ModelSpec("FE", "y", ["x"], ["c"], entity="id", time="year",
+                                 entity_effects=entity_effects, time_effects=time_effects,
+                                 se="cluster", cluster="id")
+                fit = fit_model(d, spec)
+                self.assertTrue(np.isfinite(fit.effect["p"]))
+                commands = "\n".join(stata_model(fit, names))
+                self.assertIn(absorb, commands)
+        with self.assertRaises(ValueError):
+            fit_model(d, ModelSpec("FE", "y", ["x"], entity="id", time="year",
+                                   entity_effects=False, time_effects=False))
+
     def test_rd_and_iv(self):
         d = cross(600)
         d["D"] = (d.x >= 0).astype(float)

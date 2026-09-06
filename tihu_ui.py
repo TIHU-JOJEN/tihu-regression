@@ -256,7 +256,20 @@ def specification(data):
         levels = sorted(data[s.group].dropna().astype(str).unique())
         st.caption(f"参考组：{levels[0]}")
         s.contrast = choose("比较组", levels[1:], "cfg_contrast")
-    if model in {"FE", "FE+RE", "DID", "PSM-DID"}:
+    if model in {"FE", "FE+RE"}:
+        a, b = st.columns(2)
+        with a:
+            s.entity_effects = st.checkbox("个体固定效应", value=True, key="cfg_entity_effects")
+        with b:
+            s.time_effects = st.checkbox("时间固定效应", value=True, key="cfg_time_effects")
+        if not s.entity_effects and not s.time_effects:
+            st.warning("FE 至少需要选择个体固定效应或时间固定效应")
+            return None
+        if model == "FE+RE" and not s.entity_effects:
+            st.warning("FE+RE 比较需要启用个体固定效应")
+            return None
+    elif model in {"DID", "PSM-DID"}:
+        s.entity_effects = True
         s.time_effects = st.checkbox("时间固定效应", value=True, key="cfg_time_effects")
     if model in {"DID", "PSM-DID", "PSM", "ESR", "Heckman", "Fuzzy RD"}:
         label = "选择变量 D（1=选择，0=未选择）" if model in {"ESR", "Heckman"} else "处理变量 D（1=处理，0=对照）"
