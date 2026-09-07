@@ -1,5 +1,8 @@
 """Synthetic checks for mode isolation, routing, search and exports."""
 import io
+import json
+import math
+from collections import Counter
 import unittest
 import zipfile
 from dataclasses import replace
@@ -14,6 +17,78 @@ from tihu_novice import (detect_structure, basic_spec, start_job, advance_job,
 
 
 class NoviceTests(unittest.TestCase):
+    def test_expanded_search_coverage_and_budget(self):
+        d = cross()
+        rng = np.random.default_rng(23)
+        pool = [f"control{i}" for i in range(20)]
+        for col in pool:
+            d[col] = rng.normal(size=len(d))
+        base = basic_spec(d, "y", ["x"])
+        exhaustive = start_job(d, base, pool[:10], [], [])
+        self.assertEqual(len(exhaustive["specs"]), 1024)
+        self.assertEqual({len(s.controls) for s in exhaustive["specs"]}, set(range(11)))
+        ranged = start_job(d, base, pool[:10], [], [], minimum=6)
+        self.assertEqual(len(ranged["specs"]), sum(math.comb(10, k) for k in range(6, 11)))
+        multi = replace(base, core=["x", "z", "m"])
+        sampled = start_job(d, multi, pool, [], [], minimum=6)
+        identifiers = [(tuple(s.core), tuple(s.controls)) for s in sampled["specs"]]
+        self.assertEqual(len(identifiers), 10000)
+        self.assertEqual(len(set(identifiers)), 10000)
+        self.assertTrue(all(6 <= len(s.controls) <= 10 for s in sampled["specs"]))
+        counts = Counter(s.core[0] for s in sampled["specs"])
+        self.assertLessEqual(max(counts.values())-min(counts.values()), 1)
+        again = start_job(d, multi, pool, [], [], minimum=6)
+        self.assertEqual(identifiers, [(tuple(s.core), tuple(s.controls)) for s in again["specs"]])
+        self.assertEqual(len(start_job(d, base, pool, [], [], budget=1)["specs"]), 1)
+        with self.assertRaises(ValueError):
+            start_job(d, multi, pool, [], [], budget=2)
+        with self.assertRaises(ValueError):
+            start_job(d, base, pool, [], [], budget=10001)
+        with self.assertRaises(ValueError):
+            start_job(d, base, pool[:2], [], [], minimum=6)
+
+    def test_timed_batch_and_resume(self):
+        d = cross()
+        job = start_job(d, basic_spec(d, "y", ["x"]), ["c", "z"], [], [])
+        with patch("tihu_novice.perf_counter", side_effect=[0., 2., 3.]):
+            advance_job(job, batch=50, seconds=.75)
+        self.assertEqual(job["index"], 1)
+        job.update(done=True, cancelled=True)
+        advance_job(job)
+        self.assertEqual(job["index"], 1)
+        job.update(done=False, cancelled=False)
+        advance_job(job)
+        self.assertTrue(job["done"])
+        self.assertEqual(len(job["records"]), 4)
+
+    def test_ui_stop_resume_and_range_invalidation(self):
+        script = '''import streamlit as st
+from io import BytesIO
+from unittest.mock import patch
+import numpy as np
+from test_tihu import cross
+from tihu_novice import render_novice
+d = cross()
+for i in range(10): d[f"c{i}"] = np.random.default_rng(i).normal(size=len(d))
+upload=BytesIO(d.to_csv(index=False).encode()); upload.name="range.csv"
+with patch("streamlit.file_uploader", return_value=upload): render_novice()
+'''
+        app = AppTest.from_string(script, default_timeout=60).run()
+        app.multiselect(key="nv_core").set_value(["x"]).run()
+        app.multiselect(key="nv_pool").set_value([f"c{i}" for i in range(10)]).run()
+        self.assertEqual(app.number_input(key="nv_budget").value, 10000)
+        app.button(key="nv_run").click().run()
+        self.assertFalse(app.session_state["novice_workspace"]["job"]["done"])
+        app.button(key="nv_stop").click().run()
+        job = app.session_state["novice_workspace"]["job"]
+        self.assertTrue(job["cancelled"])
+        paused_at = job["index"]
+        app.button(key="nv_resume").click().run()
+        self.assertGreater(app.session_state["novice_workspace"]["job"]["index"], paused_at)
+        app.slider(key="nv_control_range").set_range(6, 10).run()
+        self.assertNotIn("job", app.session_state["novice_workspace"])
+        self.assertEqual(len(app.exception), 0)
+
     def test_routes_and_ambiguous_panel(self):
         self.assertEqual(detect_structure(cross())[0], "横截面")
         self.assertEqual(detect_structure(panel()), ("面板", "id", "year"))
@@ -43,6 +118,7 @@ class NoviceTests(unittest.TestCase):
             self.assertIn("index.json", archive.namelist())
             self.assertIn("model_001/analysis.do", archive.namelist())
             self.assertIn("model_001/sample.dta", archive.namelist())
+            self.assertEqual(json.loads(archive.read("search_plan.json"))["planned"], 4)
 
     def test_panel_did_and_probit_followups(self):
         for model in ["FE", "DID", "Probit"]:

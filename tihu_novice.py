@@ -1,7 +1,10 @@
 """Guided workflow; all uploaded data and jobs remain in the user's session."""
 from dataclasses import asdict, replace
 from io import BytesIO
+from itertools import islice
 import json
+import math
+from time import perf_counter
 import zipfile
 
 import numpy as np
@@ -54,20 +57,38 @@ def basic_spec(data, y, core, entity="", time="", did=False, treatment="", polic
                      se="cluster" if entity else "robust", cluster=entity)
 
 
-def start_job(data, base, pool, mediators, moderators):
-    if len(pool) > 15 or len(base.core) > 6 or len(mediators) > 5 or len(moderators) > 5:
-        raise ValueError("本次支持最多 6 个核心因素、15 个候选控制变量、各 5 个中介和调节变量")
+def search_size(pool, core_count, minimum=0, maximum=10):
+    return max(1, core_count)*sum(math.comb(len(pool), size)
+                                  for size in range(minimum, min(maximum, len(pool))+1))
+
+
+def start_job(data, base, pool, mediators, moderators, minimum=0, maximum=10, budget=10000):
+    pool = unique(pool)
+    if len(pool) > 20 or len(base.core) > 6 or len(mediators) > 5 or len(moderators) > 5:
+        raise ValueError("本次支持最多 6 个核心因素、20 个候选控制变量、各 5 个中介和调节变量")
+    if not 0 <= minimum <= maximum <= 10 or minimum > len(pool):
+        raise ValueError("控制变量范围须在 0–10 个内，且下限不能超过候选变量数")
+    if not 1 <= budget <= 10000:
+        raise ValueError("单次主模型搜索预算须在 1–10,000 组内")
     reserved = unique([base.y, base.entity, base.time, base.treatment]+base.core)
     if set(pool) & set(reserved+mediators+moderators):
         raise ValueError("控制变量与研究变量角色重复，请重新选择")
     if not base.core and base.model != "DID":
         raise ValueError("请选择至少一个核心因素")
-    specs = list(candidate_specs(base, pool, 0, min(3, len(pool)), 40, joint=False))
+    # Round-robin X allocation keeps the total budget bounded and each X represented.
+    core_count = max(1, len(base.core))
+    if budget < core_count:
+        raise ValueError("搜索预算不能少于核心因素数量")
+    specs = list(islice(candidate_specs(base, pool, minimum, min(maximum, len(pool)),
+                                       math.ceil(budget/core_count), joint=False), budget))
     common = fixed_sample(data, base, pool)
     return {"data": common, "specs": specs, "index": 0, "best": {}, "records": [],
             "followups": [], "tasks": [], "task_index": 0, "stage": "base",
             "failures": {}, "mediators": list(mediators), "moderators": list(moderators),
-            "done": False, "cancelled": False, "original_n": len(data)}
+            "done": False, "cancelled": False, "original_n": len(data), "elapsed": 0.,
+            "search": {"minimum": minimum, "maximum": min(maximum, len(pool)),
+                       "budget": budget, "possible": search_size(pool, len(base.core), minimum, maximum),
+                       "planned": len(specs), "seed": 42}}
 
 
 def slim(fit):
@@ -77,9 +98,13 @@ def slim(fit):
     return fit
 
 
-def advance_job(job, batch=3):
-    for _ in range(batch):
+def advance_job(job, batch=50, seconds=None):
+    started = perf_counter()
+    for i in range(batch):
         if job["done"]:
+            break
+        # Yield between fits so slow models cannot turn a batch into a long UI lock.
+        if i and seconds is not None and perf_counter()-started >= seconds:
             break
         try:
             if job["stage"] == "base":
@@ -122,6 +147,7 @@ def advance_job(job, batch=3):
                             for var in variables]
         if job["stage"] == "followup" and job["task_index"] >= len(job["tasks"]):
             job["done"] = True
+    job["elapsed"] = job.get("elapsed", 0.)+perf_counter()-started
 
 
 def job_tick(ws):
@@ -130,10 +156,15 @@ def job_tick(ws):
         job["done"] = True
         job["cancelled"] = True
         st.rerun()
-    advance_job(job)
-    total = len(job["specs"])+len(job["tasks"])
-    completed = job["index"]+job["task_index"]
-    st.progress(completed/max(total, 1), text=f"{'主模型' if job['stage'] == 'base' else '中介与调节'} · 已完成 {completed}/{total}")
+    advance_job(job, batch=250, seconds=.75)
+    main = job["stage"] == "base"
+    total = len(job["specs"]) if main else len(job["tasks"])
+    completed = job["index"] if main else job["task_index"]
+    label = f"{'主模型' if main else '中介与调节'} · 已完成 {completed:,}/{total:,} · 计算用时 {job['elapsed']:.0f} 秒"
+    if main and job["index"] >= 20:
+        remaining = job["elapsed"]/job["index"]*(total-completed)
+        label += f" · 估算剩余计算 {remaining:.0f} 秒"
+    st.progress(completed/max(total, 1), text=label)
     if job["done"]:
         st.rerun()
 
@@ -159,6 +190,7 @@ def full_bundle(job, digest):
             catalog.append({"目录": folder, "分析": title, "模型": fit.spec.model, "设定": asdict(fit.spec)})
         archive.writestr("index.json", json.dumps(catalog, ensure_ascii=False, indent=2))
         archive.writestr("search.csv", pd.DataFrame(job["records"]).to_csv(index=False))
+        archive.writestr("search_plan.json", json.dumps(job.get("search", {}), ensure_ascii=False, indent=2))
         archive.writestr("README.txt", "每个 model 目录包含该分析实际使用的样本与 analysis.do。将 Stata 工作目录切换至对应目录运行。\n主模型按 p 值排序；中介为路径筛选，不等同于已识别的因果间接效应。\n")
     return output.getvalue()
 
@@ -169,6 +201,10 @@ def results(ws):
         return
     st.divider()
     st.subheader("实证结果")
+    if job["cancelled"] and st.button("继续搜索", icon=":material/play_arrow:", key="nv_resume"):
+        job.update(done=False, cancelled=False)
+        ws.pop("bundle", None)
+        st.rerun()
     a, b, c = st.columns(3)
     a.metric("完成组合", job["index"])
     b.metric("主模型", len(job["best"]))
@@ -306,7 +342,11 @@ def render_novice():
         mediators = multiple("候选中介变量", follow_choices, "nv_mediators")
         moderators = multiple("候选调节变量", follow_choices, "nv_moderators")
     pool = multiple("候选控制变量", [c for c in available if c not in mediators+moderators], "nv_pool")
-    setting_keys = ["nv_did", "nv_panel", "nv_structure_confirm", "nv_entity", "nv_time", "nv_y", "nv_treat", "nv_policy", "nv_core", "nv_mediators", "nv_moderators", "nv_pool"]
+    with st.expander("搜索范围"):
+        minimum, maximum = st.slider("每组控制变量个数", 0, 10, (0, 10), key="nv_control_range")
+        budget = st.number_input("主模型搜索预算（全部核心因素合计）", min_value=1, max_value=10000,
+                                 value=10000, step=100, key="nv_budget")
+    setting_keys = ["nv_did", "nv_panel", "nv_structure_confirm", "nv_entity", "nv_time", "nv_y", "nv_treat", "nv_policy", "nv_core", "nv_mediators", "nv_moderators", "nv_pool", "nv_control_range", "nv_budget"]
     ws["settings"] = {key: st.session_state[key] for key in setting_keys if key in st.session_state}
     try:
         if did and (not treatment or policy is None):
@@ -316,23 +356,26 @@ def render_novice():
         st.info(f"本次模型：{base.model}"+(" · 个体与时间双向固定效应" if base.model in {"FE", "DID"} else "")+(" · 按个体聚类" if entity else " · 稳健标准误"))
         if base.model == "Probit" and entity:
             st.caption("二元面板结果采用合并 Probit，按个体聚类，不包含个体固定效应。")
-        signature = json.dumps([asdict(base), pool, mediators, moderators], sort_keys=True)
+        signature = json.dumps([asdict(base), pool, mediators, moderators, minimum, maximum, budget], sort_keys=True)
         stale = bool(ws.get("job") and ws.get("signature") != signature)
         if stale:
             ws.pop("job", None)
             ws.pop("bundle", None)
         active = bool(ws.get("job") and not ws["job"]["done"])
         if st.button("开始自动实证", icon=":material/play_arrow:", type="primary", disabled=active, key="nv_run"):
-            ws["job"] = start_job(data, base, pool, mediators, moderators)
+            ws["job"] = start_job(data, base, pool, mediators, moderators, minimum, maximum, budget)
             ws["signature"] = signature
             ws.pop("bundle", None)
             st.session_state.pop("nv_export", None)
-        st.caption("每个核心因素最多搜索 40 组控制组合，每组最多 3 个控制变量；中介与调节沿用各核心因素的优选主模型。")
+        possible = search_size(pool, len(cores), minimum, maximum)
+        st.caption(f"符合范围 {possible:,} 组 · 本次计划 {min(possible, budget):,} 组 · "
+                   +( "全部组合" if possible <= budget else "固定种子无重复抽样")
+                   +"；中介与调节沿用各核心因素的优选主模型。")
     except Exception as exc:
         st.error(str(exc))
         return
     if ws.get("job") and not ws["job"]["done"]:
-        st.fragment(run_every=1)(job_tick)(ws)
+        st.fragment(run_every=.5)(job_tick)(ws)
     results(ws)
 
 
