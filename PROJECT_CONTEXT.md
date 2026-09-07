@@ -1,19 +1,31 @@
 # 鹈鹕回归项目说明
 
-更新日期：2026-09-05
+更新日期：2026-09-07
 
 ## 部署入口
 
 - Streamlit 入口：`panel_app.py`
 - 页面流程：`tihu_ui.py`
+- 首页模式选择、新手模式与有预算的自动任务：`tihu_novice.py`
 - 清洗、变量加工、模型估计与后续分析：`tihu_core.py`
 - Stata/Python 复现包：`tihu_export.py`
 - 合成数据测试：`test_tihu.py`
+- 新手分流、模式隔离、自动后续分析及导出测试：`test_novice.py`
 - 本机 Stata 对照测试：`verify_stata.py`
 
 Streamlit Community Cloud 从仓库根目录运行 `panel_app.py`。更新依赖时同时修改 `requirements.txt`。
 
 ## 产品流程
+
+首页先选择“我是新手 / 我懂计量”。两种模式分别使用 `novice_workspace` 和 `workspace_v2` 会话状态，共享已有估计与导出函数；切换模式保留各自的数据、设置和结果。
+
+新手流程：先问是否 DID；上传文件后按有明确含义的列名及面板键识别结构，结构不明确时需要确认。非 DID 默认连续横截面 OLS、连续面板双向 FE、0/1 结果 Probit（面板使用个体聚类的合并 Probit，不是固定效应 Probit）。DID 需要明确个体、时间、处理组、政策时间。
+
+用户指定 Y、候选核心 X、候选控制变量，可选中介/调节变量。每个 X 独立搜索最多 40 个控制组合（最多 3 项、候选池 15 项、X 最多 6 项），按 p 值保留各 X 的主结果；后续沿用其设定，最多各 5 个中介/调节变量。中介以同样本两条路径的较大 p 值排序，不宣称因果间接效应；调节以交互项排序。未显著的有效结果仍显示。任务可停止，改设定/文件使旧结果失效。
+
+新手导出包含每项实际分析样本、对应 Stata/Python 代码、设定和所有成功组合记录。代码可展开复制，但完整复现需要对应 model 目录的数据文件。文件仅在会话内存中处理和打包，不调用外部 AI。
+
+专家流程沿用：
 
 1. 上传 DTA、CSV 或 XLSX。
 2. 按顺序建立可编辑的数据清洗和变量加工步骤。
@@ -53,17 +65,22 @@ Streamlit Community Cloud 从仓库根目录运行 `panel_app.py`。更新依赖
 运行：
 
 ```bash
-python3 -m unittest test_tihu -v
+python3 -m unittest test_tihu test_novice -v
 ```
 
 本机安装 Stata 时可运行：
 
 ```bash
 python3 verify_stata.py
+python3 verify_stata.py --novice-only
 ```
+
+2026-09-07 验证：21 项自动测试通过；新手四条模型路线的 20 项主模型、中介路径和调节回归通过本机 Stata 系数/标准误对照。真实浏览器使用合成 CSV 验证上传、自动运行、后续分析、整包导出、模式切换恢复，以及桌面和 390px 手机布局。
 
 测试只生成合成数据。当前对照覆盖 OLS 普通/稳健/聚类、Logit、Poisson、FE、RE、DID、Tobit、Heckman、IV、Sharp/Fuzzy RD，以及 ESR 的 ATT/ATU 与稳健标准误。
 
 ## 回滚
 
 新版前的线上版本是提交 `023b56a`。发生部署问题时可由该提交恢复；不要使用桌面其他目录中的旧副本覆盖部署入口。
+
+新增新手模式前的完整专家版为 `c24683c`；新手模块独立于专家页面，恢复该版本可回退首页分流。

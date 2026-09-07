@@ -4,6 +4,7 @@ import json
 import re
 from pathlib import Path
 import subprocess
+import sys
 import zipfile
 import numpy as np
 import pandas as pd
@@ -54,7 +55,8 @@ def run(name, d, spec):
     names = manifest['column_names']
     if spec.model != 'ESR':
         focus = fit.effect['term']
-        stataterm = '_cons' if focus == 'const' else names.get(focus, focus)
+        # Generated DID and interaction terms are recreated under their internal names.
+        stataterm = '_cons' if focus == 'const' else (focus if focus.startswith('__') else names.get(focus, focus))
         row = table[table.term.str.split(':').str[-1] == stataterm].iloc[0]
         print(name, 'coef_delta', float(row.coef-fit.effect['coef']), 'se_delta', float(row.se-fit.effect['se']))
         assert abs(row.coef-fit.effect['coef']) < 2e-4, name
@@ -69,7 +71,26 @@ def run(name, d, spec):
     return True
 
 
+def run_novice_cases():
+    from tihu_novice import basic_spec, start_job, advance_job, all_results
+    for model in ['OLS', 'FE', 'DID', 'Probit']:
+        data = panel() if model in {'FE', 'DID'} else cross()
+        spec = basic_spec(data, 'binary' if model == 'Probit' else 'y',
+                          [] if model == 'DID' else ['x'],
+                          'id' if model in {'FE', 'DID'} else '',
+                          'year' if model in {'FE', 'DID'} else '',
+                          model == 'DID', 'D' if model == 'DID' else '', 2017)
+        job = start_job(data, spec, ['c'], ['m'], ['z'])
+        advance_job(job, batch=20)
+        assert job['done'] and not job['failures'], job['failures']
+        for i, (_, fit) in enumerate(all_results(job)):
+            run(f'novice_{model}_{i}', fit.sample, fit.spec)
+
+
 if __name__ == '__main__':
+    if '--novice-only' in sys.argv:
+        run_novice_cases()
+        sys.exit(0)
     d = cross(700)
     cases = [('ols', ModelSpec('OLS','y',['x'],['c'],se='robust')),
              ('cluster', ModelSpec('OLS','y',['x'],['c'],se='cluster',cluster='group')),

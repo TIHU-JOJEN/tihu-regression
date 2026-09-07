@@ -2,7 +2,7 @@
 import base64
 from pathlib import Path
 import streamlit as st
-from tihu_ui import render_workbench
+from tihu_novice import render_entry
 
 st.set_page_config(page_title="鹈鹕回归", layout="wide")
 
@@ -177,12 +177,9 @@ def render_home_hero():
           <div class="flow-item"><div class="flow-num">05</div><div class="flow-copy">全流程显著实证搜寻</div></div>
           <div class="flow-item"><div class="flow-num">06</div><div class="flow-copy">自动生成可复现 Stata 代码</div></div>
         </div>
-        <div class="flow-note">从这里开始，下面直接进入数据上传与实证流程。</div>
+        <div class="flow-note">我是新手 · 我懂计量</div>
       </div>
     </section>
     """, unsafe_allow_html=True)
 
-render_home_hero()
-
-
-render_workbench()
+render_entry(render_home_hero)

@@ -742,14 +742,22 @@ def render_workbench():
         st.caption("上传数据在本次服务器会话内处理；本程序不主动持久保存用户数据，也不向 AI 服务发送数据。")
         st.button("清除本次数据和结果", icon=":material/delete:", on_click=reset_session, key="clear_all")
     st.subheader("上传数据")
-    uploaded = st.file_uploader("数据文件", type=["dta", "csv", "xlsx"], key="data_upload")
-    if uploaded is None:
+    def upload_changed():
+        if (st.session_state.get("data_upload") is None
+                and st.session_state.get("expert_upload_present", False)
+                and st.session_state.get("experience_mode", "我懂计量") == "我懂计量"
+                and not st.session_state.get("mode_back", False)):
+            st.session_state["workspace_v2"].clear()
+            invalidate(st.session_state["workspace_v2"])
+    uploaded = st.file_uploader("数据文件", type=["dta", "csv", "xlsx"], key="data_upload", on_change=upload_changed)
+    st.session_state["expert_upload_present"] = uploaded is not None
+    if uploaded is None and "raw" not in ws:
         return
-    content = uploaded.getvalue()
-    if len(content) > 50*1024*1024:
+    content = uploaded.getvalue() if uploaded is not None else None
+    if content is not None and len(content) > 50*1024*1024:
         st.error("当前版本单个文件上限为 50 MB，请先选择需要的样本与变量")
         return
-    digest = fingerprint(content)
+    digest = fingerprint(content) if content is not None else ws["hash"]
     if ws.get("hash") != digest:
         try:
             if uploaded.name.lower().endswith(".dta"):
@@ -776,6 +784,8 @@ def render_workbench():
         except Exception as e:
             st.error(f"读取失败：{e}"); return
     raw = ws["raw"]
+    if uploaded is None:
+        st.caption("已载入："+ws.get("name", "本次数据"))
     if ws.get("pending_config"):
         pending = ws.pop("pending_config")
         for key, val in pending["settings"].items():

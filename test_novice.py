@@ -1,0 +1,129 @@
+"""Synthetic checks for mode isolation, routing, search and exports."""
+import io
+import unittest
+import zipfile
+from dataclasses import replace
+from unittest.mock import patch
+
+import numpy as np
+from streamlit.testing.v1 import AppTest
+
+from test_tihu import cross, panel
+from tihu_novice import (detect_structure, basic_spec, start_job, advance_job,
+                         full_bundle)
+
+
+class NoviceTests(unittest.TestCase):
+    def test_routes_and_ambiguous_panel(self):
+        self.assertEqual(detect_structure(cross())[0], "横截面")
+        self.assertEqual(detect_structure(panel()), ("面板", "id", "year"))
+        duplicate = panel()
+        duplicate.loc[1, "year"] = duplicate.loc[0, "year"]
+        self.assertEqual(detect_structure(duplicate)[0], "待确认")
+        self.assertEqual(basic_spec(cross(), "binary", ["x"]).model, "Probit")
+        self.assertEqual(basic_spec(panel(), "y", ["x"], "id", "year").model, "FE")
+        self.assertEqual(basic_spec(panel(), "y", [], "id", "year", True, "D", 2017).model, "DID")
+
+    def test_complete_search_and_bundle(self):
+        d = cross()
+        d["m"] = .8*d.x+d.m
+        d["y"] += .8*d.m
+        job = start_job(d, basic_spec(d, "y", ["x", "z"]), ["c"], ["m"], ["group"])
+        original = d.copy(deep=True)
+        for _ in range(20):
+            advance_job(job)
+            if job["done"]:
+                break
+        self.assertTrue(job["done"])
+        self.assertEqual(set(job["best"]), {"x", "z"})
+        self.assertEqual(len(job["records"]), 4)
+        self.assertEqual(len(job["followups"]), 4)
+        self.assertTrue(d.equals(original))
+        with zipfile.ZipFile(io.BytesIO(full_bundle(job, "synthetic"))) as archive:
+            self.assertIn("index.json", archive.namelist())
+            self.assertIn("model_001/analysis.do", archive.namelist())
+            self.assertIn("model_001/sample.dta", archive.namelist())
+
+    def test_panel_did_and_probit_followups(self):
+        for model in ["FE", "DID", "Probit"]:
+            with self.subTest(model=model):
+                d = panel() if model != "Probit" else cross()
+                if model == "DID":
+                    spec = basic_spec(d, "y", [], "id", "year", True, "D", 2017)
+                elif model == "FE":
+                    spec = basic_spec(d, "y", ["x"], "id", "year")
+                else:
+                    spec = basic_spec(d, "binary", ["x"])
+                job = start_job(d, spec, ["c"], ["m"], ["z"])
+                advance_job(job, batch=20)
+                self.assertTrue(job["done"])
+                self.assertEqual(len(job["best"]), 1)
+                self.assertEqual(len(job["followups"]), 2, job["failures"])
+                self.assertTrue(all(np.isfinite(row["筛选 p"]) for row in job["followups"]))
+
+    def test_modes_and_new_file_invalidation(self):
+        script = '''import streamlit as st
+from io import BytesIO
+from unittest.mock import patch
+from test_tihu import cross
+from tihu_novice import render_entry
+st.set_page_config(layout="wide")
+upload=BytesIO(cross(seed=st.session_state.get("test_seed",42)).to_csv(index=False).encode()); upload.name="synthetic.csv"
+with patch("streamlit.file_uploader", side_effect=lambda *a, **kw: upload if not st.session_state.get("test_no_upload", False) and kw.get("key") in {"nv_upload","data_upload"} else None):
+    render_entry(lambda: st.title("鹈鹕回归"))
+'''
+        app = AppTest.from_string(script, default_timeout=60).run()
+        self.assertEqual(len(app.exception), 0)
+        app.button(key="mode_novice").click().run()
+        app.multiselect(key="nv_core").set_value(["x"]).run()
+        app.multiselect(key="nv_mediators").set_value(["m"]).run()
+        app.multiselect(key="nv_moderators").set_value(["z"]).run()
+        app.button(key="nv_run").click().run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertTrue(app.session_state["novice_workspace"]["job"]["done"])
+        app.button(key="nv_pack").click().run()
+        self.assertIn("bundle", app.session_state["novice_workspace"])
+        app.button(key="mode_back").click().run()
+        app.button(key="mode_expert").click().run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertEqual(len(app.selectbox(key="cfg_y").options) > 0, True)
+        expert_y = app.selectbox(key="cfg_y").value
+        app.button(key="mode_back").click().run()
+        app.session_state["test_no_upload"] = True
+        app.button(key="mode_novice").click().run()
+        self.assertTrue(app.session_state["novice_workspace"]["job"]["done"])
+        self.assertEqual(app.multiselect(key="nv_core").value, ["x"])
+        app.button(key="mode_back").click().run()
+        app.button(key="mode_expert").click().run()
+        self.assertEqual(app.selectbox(key="cfg_y").value, expert_y)
+        app.button(key="mode_back").click().run()
+        app.button(key="mode_novice").click().run()
+        app.session_state["test_no_upload"] = False
+        app.session_state["test_seed"] = 8
+        app.run()
+        self.assertNotIn("job", app.session_state["novice_workspace"])
+
+    def test_did_ui_requires_policy_time(self):
+        script = '''import streamlit as st
+from io import BytesIO
+from unittest.mock import patch
+from test_tihu import panel
+from tihu_novice import render_novice
+upload=BytesIO(panel().to_csv(index=False).encode()); upload.name="panel.csv"
+with patch("streamlit.file_uploader", return_value=upload): render_novice()
+'''
+        app = AppTest.from_string(script, default_timeout=60).run()
+        app.radio(key="nv_did").set_value("做 DID").run()
+        self.assertEqual(app.selectbox(key="nv_entity").value, "id")
+        self.assertEqual(app.selectbox(key="nv_time").value, "year")
+        self.assertIsNone(app.selectbox(key="nv_policy").value)
+        self.assertNotIn("nv_run", [button.key for button in app.button])
+        app.selectbox(key="nv_policy").select(2017).run()
+        self.assertEqual(len(app.error), 0)
+        app.button(key="nv_run").click().run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertEqual(app.session_state["novice_workspace"]["job"]["best"]["DID"].spec.model, "DID")
+
+
+if __name__ == "__main__":
+    unittest.main()
