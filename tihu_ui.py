@@ -1,6 +1,7 @@
 """Session-scoped, stepwise econometrics workbench."""
 from dataclasses import asdict, replace
 from io import BytesIO
+from itertools import islice
 import json
 import math
 import time
@@ -55,7 +56,9 @@ def display_table(table):
     renamed = table.rename(columns={"term": "变量/效应", "coef": "系数", "se": "标准误", "p": "p 值", "lower": "95%下限", "upper": "95%上限"})
     if "p 值" in renamed:
         renamed["显著性"] = renamed["p 值"].map(lambda p: "***" if p < .01 else ("**" if p < .05 else ("*" if p < .1 else "")))
-    st.dataframe(renamed, width="stretch", hide_index=True, column_config={c: st.column_config.NumberColumn(format="%.6f") for c in ["系数", "标准误", "p 值", "95%下限", "95%上限"]})
+    formats = {c: st.column_config.NumberColumn(format="%.6f") for c in ["系数", "标准误", "p 值", "95%下限", "95%上限"]}
+    formats["排序 p"] = st.column_config.NumberColumn(format="%.4g")
+    st.dataframe(renamed, width="stretch", hide_index=True, column_config=formats)
 
 
 @st.cache_data(show_spinner=False)
@@ -362,54 +365,92 @@ def specification(data):
     return s, pool
 
 
-def search_tick(ws):
-    job = ws.get("job")
-    if not job or job["done"]:
-        return
-    cancel = st.button("停止搜索并保留结果", icon=":material/stop:", key="cancel_search")
-    if cancel:
-        job["done"] = True; st.rerun()
-    limit = min(job["index"]+1, len(job["specs"]))
-    while job["index"] < limit:
+def expert_specs(s, pool, minimum, maximum, budget, joint=True):
+    count = 1 if joint else max(1, len(s.core))
+    if not count <= budget <= 10000:
+        raise ValueError("搜索预算须覆盖各核心因素，且合计不能超过 10,000 组")
+    return list(islice(candidate_specs(s, pool, minimum, maximum,
+                                      math.ceil(budget/count), joint=joint), budget))
+
+
+def advance_search(job, batch=250, seconds=.75):
+    started = time.perf_counter()
+    for i in range(batch):
+        if job["done"] or job["index"] >= len(job["specs"]):
+            break
+        if i and seconds is not None and time.perf_counter()-started >= seconds:
+            break
         spec = job["specs"][job["index"]]
         try:
             result = fit_model(job["data"], spec)
             score = rank_fit(result, job["joint"])
-            result.fitted = None; result.design = None; result.response = None
-            for _, previous in job["fits"]:
-                if result.sample.index.equals(previous.sample.index) and result.sample.columns.equals(previous.sample.columns) and result.sample.equals(previous.sample):
-                    result.sample = previous.sample
-                    break
-            job["fits"].append((score, result))
-            job["fits"].sort(key=lambda pair: pair[0])
-            job["fits"] = job["fits"][:50]
+            if not np.isfinite(score):
+                raise ValueError("目标检验未产生有效 p 值")
+            job.setdefault("records", []).append({"组合编号": job["index"]+1,
+                "模型": spec.model, "核心 X": "、".join(spec.core) or result.effect["term"],
+                "控制变量": "、".join(spec.controls) or "无", "N": len(result.sample),
+                "排序 p": score, **result.effect})
+            # Keep complete objects only for the best 50; all successful rows remain available.
+            if len(job["fits"]) < 50 or score < job["fits"][-1][0]:
+                result.fitted = None; result.design = None; result.response = None
+                for _, previous in job["fits"]:
+                    if result.sample.index.equals(previous.sample.index) and result.sample.columns.equals(previous.sample.columns) and result.sample.equals(previous.sample):
+                        result.sample = previous.sample
+                        break
+                job["fits"].append((score, result))
+                job["fits"].sort(key=lambda pair: pair[0])
+                job["fits"] = job["fits"][:50]
         except Exception as exc:
             reason = str(exc)[:150]
             job["failures"][reason] = job["failures"].get(reason, 0)+1
         job["index"] += 1
-    ws["fits"] = [f for _, f in job["fits"]]
-    st.progress(job["index"]/max(len(job["specs"]), 1), text=f"已完成 {job['index']}/{len(job['specs'])} · 有效 {job['index']-sum(job['failures'].values())} · 跳过 {sum(job['failures'].values())}")
+    job["elapsed"] = job.get("elapsed", 0.)+time.perf_counter()-started
     if job["index"] >= len(job["specs"]):
         job["done"] = True
+
+
+def search_tick(ws):
+    job = ws.get("job")
+    if not job or job["done"]:
+        return
+    if st.button("停止搜索并保留结果", icon=":material/stop:", key="cancel_search"):
+        job.update(done=True, cancelled=True)
+        st.rerun()
+    advance_search(job)
+    ws["fits"] = [f for _, f in job["fits"]]
+    label = f"已完成 {job['index']:,}/{len(job['specs']):,} · 有效 {len(job.get('records', [])):,} · 计算用时 {job['elapsed']:.0f} 秒"
+    if job["index"] >= 20:
+        remaining = job["elapsed"]/job["index"]*(len(job["specs"])-job["index"])
+        label += f" · 估算剩余计算 {remaining:.0f} 秒"
+    st.progress(job["index"]/max(len(job["specs"]), 1), text=label)
+    if job["done"]:
         st.rerun()
 
 
 def search_controls(ws, data, s, pool):
     st.subheader("3 · 估计与组合搜索")
+    pool = [col for col in unique(pool) if col not in s.controls+s.core]
     a, b, c = st.columns(3)
     with a:
         minimum = number("最少候选控制数", "cfg_min", 0, min_value=0, max_value=20)
     with b:
-        maximum = number("最多候选控制数", "cfg_max", min(3, len(pool)), min_value=0, max_value=20)
+        maximum = number("最多候选控制数", "cfg_max", 10, min_value=0, max_value=20)
     with c:
-        budget = number("最多尝试组合数", "cfg_budget", 50 if s.model == "ESR" else 200, min_value=1, max_value=10000)
+        budget = number("主模型搜索预算（合计）", "cfg_budget", 10000, min_value=1, max_value=10000)
     sample_mode = choose("样本规则", ["固定样本（整个候选池共同有效）", "每个组合自身有效样本"], "cfg_sample_mode")
     joint = True
     if len(s.core) > 1:
         joint = choose("核心 X 搜索方式", ["联合显著", "各自搜索"], "cfg_joint") == "联合显著"
-    total = sum(math.comb(len(pool), k) for k in range(minimum, min(maximum, len(pool))+1))
-    st.caption(f"候选组合 {total:,} · 本次最多尝试 {min(total, budget):,} · 无候选变量时直接估计必选设定")
+    count = 1 if joint else max(1, len(s.core))
+    total = count*sum(math.comb(len(pool), k) for k in range(minimum, min(maximum, len(pool))+1))
+    st.caption(f"候选组合 {total:,} · 本次最多尝试 {min(total, budget):,} · "
+               +( "全部组合" if total <= budget else "固定种子无重复抽样")
+               +f" · 每组另含 {len(s.controls)} 个必选控制变量")
+    signature = json.dumps([asdict(s), pool, minimum, maximum, budget, joint, sample_mode], sort_keys=True, default=str)
     job = ws.get("job")
+    if job and job.get("signature") != signature:
+        invalidate(ws)
+        job = None
     active = job and not job["done"]
     if st.button("开始估计" if not pool else "开始搜索", type="primary", disabled=bool(active), key="run_search"):
         try:
@@ -419,20 +460,42 @@ def search_controls(ws, data, s, pool):
                 raise ValueError("请选择选择方程变量")
             if s.model == "IV/2SLS" and (not s.core or not s.instruments):
                 raise ValueError("请选择内生变量和工具变量")
-            specs = list(candidate_specs(s, pool, minimum, maximum, budget, joint=joint))
+            specs = expert_specs(s, pool, minimum, maximum, budget, joint)
             if not specs:
                 raise ValueError("没有可运行组合，请调整候选控制数")
             search_data = fixed_sample(data, s, pool) if sample_mode.startswith("固定") else data.copy()
             invalidate(ws)
-            ws["job"] = {"data": search_data, "specs": specs, "index": 0, "fits": [], "failures": {}, "joint": joint, "done": False, "signature": json.dumps(asdict(s), sort_keys=True, default=str)}
+            ws["job"] = {"data": search_data, "specs": specs, "index": 0, "fits": [], "failures": {},
+                         "joint": joint, "done": False, "cancelled": False, "records": [],
+                         "elapsed": 0., "signature": signature}
         except Exception as e:
             st.error(str(e))
     job = ws.get("job")
+    if job and job.get("cancelled") and st.button("继续搜索", icon=":material/play_arrow:", key="resume_search"):
+        job.update(done=False, cancelled=False)
+        st.rerun()
     if job and not job["done"]:
-        st.fragment(run_every=1)(search_tick)(ws)
+        st.fragment(run_every=.5)(search_tick)(ws)
         job = ws.get("job")
     if job and job["done"]:
-        st.caption(f"已完成 {job['index']} 个组合 · 保留 {len(ws.get('fits', []))} 个有效结果")
+        st.caption(f"{'已停止' if job.get('cancelled') else '已完成'} {job['index']:,} 个组合 · 有效 {len(job.get('records', [])):,} 个 · 优选详情 {len(job['fits'])} 个")
+        if job.get("records"):
+            with st.expander("全部有效组合"):
+                records = pd.DataFrame(job["records"]).sort_values("排序 p")
+                display_table(records)
+                st.download_button("下载全部有效组合", records.to_csv(index=False).encode("utf-8-sig"),
+                                   "tihu_search.csv", "text/csv", key="download_search")
+                selected = choose("查看组合编号", records["组合编号"], "inspect_combination")
+                if st.button("载入该组合详情", icon=":material/table_view:", key="load_combination"):
+                    try:
+                        fit = fit_model(job["data"], job["specs"][selected-1])
+                        fit.fitted = None; fit.design = None; fit.response = None
+                        ws["fits"] = [fit]+[f for _, f in job["fits"] if f.spec != fit.spec]
+                        st.session_state["selected_result"] = 1
+                        for key in ["follow", "bundle", "indirect", "follow_bundle", "selected_token"]:
+                            ws.pop(key, None)
+                    except Exception as exc:
+                        st.error(f"该组合未能重新估计：{exc}")
         if job["failures"]:
             with st.expander("跳过的组合"):
                 st.dataframe(pd.DataFrame([{"原因": k, "数量": v} for k, v in job["failures"].items()]), hide_index=True)
@@ -615,6 +678,7 @@ def results_ui(ws, raw):
         st.download_button("下载复现包（包含本次数据）", bundle, "tihu_reproducible.zip", mime="application/zip", key="download_bundle")
         st.download_button("下载 Stata .do", do, "analysis.do", key="download_do")
     with st.expander("对比多个结果"):
+        st.session_state["compare_results"] = [i for i in st.session_state.get("compare_results", []) if i < len(fits)]
         selected = st.multiselect("结果编号", range(len(fits)), format_func=lambda i: str(i+1), key="compare_results")
         if selected:
             st.dataframe(summary.iloc[selected], hide_index=True, width="stretch")
