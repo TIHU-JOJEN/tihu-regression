@@ -87,7 +87,22 @@ def run_novice_cases():
             run(f'novice_{model}_{i}', fit.sample, fit.spec)
 
 
+def run_iv_cases():
+    from test_instruments import instrument_data
+    d = instrument_data(200)
+    for se in ['ordinary', 'robust', 'cluster']:
+        spec = ModelSpec('IV/2SLS', 'y', ['x'], ['c'], se=se, cluster='id', instruments=['z', 'z2'], auto_instrument=True)
+        run('iv_auto_'+se, d, spec)
+        for entity_effects, time_effects in [(True, False), (False, True), (True, True)]:
+            from dataclasses import replace
+            run(f'iv_fe_{se}_{entity_effects}_{time_effects}', d,
+                replace(spec, entity='id', time='year', entity_effects=entity_effects, time_effects=time_effects))
+
+
 if __name__ == '__main__':
+    if '--iv-only' in sys.argv:
+        run_iv_cases()
+        sys.exit(0)
     if '--novice-only' in sys.argv:
         run_novice_cases()
         sys.exit(0)

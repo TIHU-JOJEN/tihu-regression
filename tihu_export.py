@@ -143,7 +143,19 @@ def stata_model(fit, names):
             else:
                 lines += [f"ivregress 2sls {y} {rhs} ({n(s.treatment)}=__rd_z), small {vce}", "estat firststage"]
     elif s.model == "IV/2SLS":
-        lines += [f"ivregress 2sls {y} {terms(s.controls)} ({n(s.core[0])}={terms(s.instruments)}), small {vce}", "estat firststage"]
+        effects = []
+        if s.entity:
+            if s.entity_effects:
+                lines += [f"egen long __iv_id = group({n(s.entity)})"]
+                effects.append("i.__iv_id")
+            if s.time_effects:
+                lines += [f"egen long __iv_time = group({n(s.time)})"]
+                effects.append("i.__iv_time")
+        lines += [f"regress {n(s.core[0])} {terms(s.controls)} {' '.join(effects)} {terms(s.instruments)}{option}",
+                  f"testparm {terms(s.instruments)}", "scalar __firststage_F = r(F)",
+                  "* F > 10 is a relevance screen, not proof of instrument exogeneity.",
+                  f"ivregress 2sls {y} {terms(s.controls)} {' '.join(effects)} ({n(s.core[0])}={terms(s.instruments)}), small {vce}",
+                  "estat firststage", "capture noisily estat endogenous", "capture estat overid"]
     elif s.model == "Tobit":
         bounds = " ".join(([f"ll({s.left})"] if s.left is not None else [])+([f"ul({s.right})"] if s.right is not None else []))
         lines += [f"tobit {y} {rhs}, {bounds} {vce}"]
@@ -153,6 +165,9 @@ def stata_model(fit, names):
         lines += ["* Same fixed matched pairs as the web result; propensity score uncertainty is not included.", 'merge 1:1 __rowid using "matches.dta", keep(match) nogen', f"collapse (mean) {y}, by(__pair {n(s.treatment)})", f"reshape wide {y}, i(__pair) j({n(s.treatment)})", f"gen double __diff = {y}1-{y}0", "ttest __diff == 0"]
     elif s.model == "ESR":
         z, x0, x1, treatment = terms(s.selection), terms(s.regime0 or s.controls), terms(s.regime1 or s.controls), n(s.treatment)
+        if s.auto_instrument and s.instruments:
+            lines += [f"probit {treatment} {z}{option}", f"testparm {terms(s.instruments)}",
+                      "* Probit relevance test for ESR; do not apply the 2SLS F > 10 rule."]
         lines += [
             "* Full-information Gaussian endogenous switching likelihood; no movestay dependency.",
             "capture program drop tihu_esr_ll", "program define tihu_esr_ll", "    version 16",
@@ -211,6 +226,16 @@ def reproducibility_bundle(raw, steps, fit, file_hash):
         z.writestr("sample.dta", dta_bytes(selected))
         z.writestr("analysis.do", do+"\n")
         z.writestr("result.csv", fit.table.to_csv(index=False))
+        if fit.spec.model in {"IV/2SLS", "ESR"}:
+            diagnostic_files = {}
+            for i, (title, value) in enumerate(fit.details.items(), 1):
+                if isinstance(value, pd.DataFrame):
+                    filename = f"diagnostic_{i:02d}.csv"
+                    z.writestr(filename, value.to_csv(index=False))
+                    diagnostic_files[title] = filename
+                elif isinstance(value, (str, int, float)):
+                    diagnostic_files[title] = value
+            z.writestr("diagnostics.json", json.dumps(diagnostic_files, ensure_ascii=False, indent=2, default=str))
         if "effects" in fit.details:
             z.writestr("effects.csv", fit.details["effects"].to_csv(index=False))
         z.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2, default=str))
@@ -219,6 +244,7 @@ def reproducibility_bundle(raw, steps, fit, file_hash):
             pairs = [{"__rowid": int(fit.sample.index[row]), "__pair": i} for i, (t, controls) in enumerate(fit.details["pairs"]) for row in [t]+controls]
             z.writestr("matches.dta", dta_bytes(pd.DataFrame(pairs)))
         z.writestr("tihu_core.py", Path(__file__).with_name("tihu_core.py").read_text())
+        z.writestr("tihu_iv.py", Path(__file__).with_name("tihu_iv.py").read_text())
         z.writestr("replay.py", '''import json
 from dataclasses import fields
 import pandas as pd
@@ -233,7 +259,7 @@ result = fit_model(data.loc[config["sample_rows"]], ModelSpec(**config["spec"]))
 print(result.table.to_string(index=False))
 print(result.effect)
 ''')
-        packages = ["streamlit", "pandas", "numpy", "statsmodels", "linearmodels", "scipy", "scikit-learn", "openpyxl"]
+        packages = ["streamlit", "pandas", "numpy", "statsmodels", "linearmodels", "pyhdfe", "scipy", "scikit-learn", "openpyxl"]
         z.writestr("requirements.txt", "\n".join(f"{package}=={importlib.metadata.version(package)}" for package in packages)+"\n")
         z.writestr("README.txt", "此文件包包含本次原始数据，请自行保管。\nanalysis.do: 在 Stata 中将工作目录切换到解压目录后运行。\nsource.dta: 原始数据；sample.dta: 选定估计样本行号。\n清洗及变量加工在 analysis.do 中重做；匹配结果使用本次固定匹配样本。\nreplay.py: 使用相同 Python 依赖重新计算。\n网页与 Stata 的有限样本标准误修正可能存在差异；未经 Stata 实机数值验收的模型不能保证逐位一致。\nESR 使用完整联合似然，ATT/ATU 对固定协变量样本采用 Delta 法。\n")
     return out.getvalue(), do

@@ -14,7 +14,7 @@ import streamlit as st
 from tihu_core import (ModelSpec, binary, candidate_specs, fingerprint, fit_model,
                        fixed_sample, mechanism_analysis, unique, validate_panel)
 from tihu_export import reproducibility_bundle, stata_script
-from tihu_ui import choose, multiple, display_table
+from tihu_ui import choose, multiple, display_table, iv_followup_panel
 
 
 def detect_structure(data):
@@ -210,7 +210,7 @@ def results(ws):
     b.metric("主模型", len(job["best"]))
     c.metric("显著主结果", sum(f.effect["p"] < .1 for f in job["best"].values()))
     st.caption(f"原始 {job['original_n']} 行 · 共同有效样本 {len(job['data'])} 行 · 显著阈值 p<0.10 · {'已停止' if job['cancelled'] else '已完成'}")
-    tabs = st.tabs(["主结果", "中介与调节", "Stata 复现"])
+    tabs = st.tabs(["主结果", "中介与调节", "Stata 复现", "内生性处理"])
     with tabs[0]:
         if not job["best"]:
             st.info("本次没有可估计的主模型，请查看未完成项目。")
@@ -244,6 +244,13 @@ def results(ws):
                     ws["bundle"] = full_bundle(job, ws["hash"])
             if ws.get("bundle"):
                 st.download_button("下载全部结果与代码", ws["bundle"], "tihu_beginner.zip", "application/zip", key="nv_download")
+    with tabs[3]:
+        available = {key: fit for key, fit in job["best"].items() if fit.spec.model in {"OLS", "FE", "LPM"}}
+        if available:
+            key = choose("基准结果", available, "nv_iv_baseline")
+            iv_followup_panel(ws, available[key], "nv_iv", job["mediators"]+job["moderators"])
+        else:
+            st.info("当前基准不是普通线性模型，不会自动替换为 2SLS。")
     if job["failures"]:
         with st.expander("未完成项目"):
             st.dataframe(pd.DataFrame([{"原因": key, "数量": value} for key, value in job["failures"].items()]), hide_index=True)

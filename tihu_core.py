@@ -17,7 +17,7 @@ from statsmodels.miscmodels.ordinal_model import OrderedModel
 from linearmodels.iv import IV2SLS
 from linearmodels.panel import PanelOLS, RandomEffects
 
-VERSION = "2026.09.05"
+VERSION = "2026.09.09"
 
 
 def unique(values):
@@ -40,53 +40,12 @@ def infer_type(values):
     return "连续"
 
 
-def esr_identification_candidates(data, y, treatment, candidates, alpha=.10):
-    """Screen observable relevance and a no-direct-effect exclusion proxy."""
-    columns = ["变量", "相关性 p值", "排他性代理 p值", "有效样本"]
-    if not binary(data[treatment]):
-        return pd.DataFrame(columns=columns)
-
-    def joint_p(result, terms):
-        if len(terms) == 1:
-            return float(result.pvalues[terms[0]])
-        restriction = np.zeros((len(terms), len(result.params)))
-        positions = {name: i for i, name in enumerate(result.params.index)}
-        for row, term in enumerate(terms):
-            restriction[row, positions[term]] = 1
-        return float(np.asarray(result.wald_test(restriction, scalar=True).pvalue).item())
-
-    rows = []
-    for candidate in unique(candidates):
-        nuisance = []
-        for column in unique(candidates):
-            if column == candidate:
-                continue
-            values = data[column].dropna()
-            if pd.api.types.is_numeric_dtype(data[column]) or values.nunique() <= 10:
-                nuisance.append(column)
-            if len(nuisance) == 20:
-                break
-        d = data[unique([y, treatment, candidate]+nuisance)].dropna()
-        if len(d) < 30 or d[candidate].nunique() < 2:
-            continue
-        try:
-            candidate_x = design(d, [candidate])
-            candidate_terms = [c for c in candidate_x if c != "const"]
-            first_x = design(d, [candidate]+nuisance)
-            first = sm.OLS(d[treatment].astype(float), first_x).fit(cov_type="HC1")
-            relevance_p = joint_p(first, candidate_terms)
-
-            outcome_x = design(d, [treatment, candidate]+nuisance)
-            direct_terms = candidate_terms
-            outcome = sm.OLS(d[y].astype(float), outcome_x).fit(cov_type="HC1")
-            exclusion_p = joint_p(outcome, direct_terms)
-        except (ValueError, np.linalg.LinAlgError, ZeroDivisionError):
-            continue
-        if np.isfinite([relevance_p, exclusion_p]).all() and relevance_p < alpha <= exclusion_p:
-            rows.append({"变量": candidate, "相关性 p值": relevance_p, "排他性代理 p值": exclusion_p, "有效样本": len(d)})
-    if not rows:
-        return pd.DataFrame(columns=columns)
-    return pd.DataFrame(rows).sort_values(["相关性 p值", "排他性代理 p值"], ascending=[True, False])
+def esr_identification_candidates(data, y, treatment, candidates, alpha=.05):
+    """Compatibility entry: Probit relevance only, never an exclusion certification."""
+    from tihu_iv import esr_candidates
+    s = ModelSpec("ESR", y, treatment=treatment)
+    screened = esr_candidates(data, s, [c for c in data if c not in candidates])
+    return screened[screened["相关性 p值"] < alpha]
 
 
 def validate_panel(df, entity, time):
@@ -178,6 +137,9 @@ def apply_steps(raw, steps):
                 work[name] = lag if op == "lag" else x.to_numpy()-lag
             else:
                 raise ValueError("不支持的操作")
+            lineage = dict(work.attrs.get("tihu_lineage", {}))
+            lineage[name] = unique(cols+[source for c in cols for source in lineage.get(c, [])])
+            work.attrs["tihu_lineage"] = lineage
         work = work.replace([np.inf, -np.inf], np.nan)
         common = before.index.intersection(work.index)
         compared = cols if "name" not in step else []
@@ -218,6 +180,7 @@ class ModelSpec:
     interactions: list = field(default_factory=list)
     group: str = ""
     contrast: str = ""
+    auto_instrument: bool = False
 
 
 @dataclass
@@ -433,7 +396,18 @@ def fit_model(data, spec):
         warnings.simplefilter("ignore")
         d = frame(data, s)
         if s.model == "ESR":
-            return fit_esr(d, s)
+            if s.auto_instrument:
+                from tihu_iv import esr_test
+                check = esr_test(d, s, s.instruments)
+                if not check["通过初筛"]:
+                    raise ValueError("当前控制组合的识别变量未通过 Probit 选择方程 p<0.05 初筛")
+            result = fit_esr(d, s)
+            if s.auto_instrument:
+                result.details["识别变量检验"] = pd.DataFrame([check])
+            return result
+        if s.model == "IV/2SLS":
+            from tihu_iv import fit_iv
+            return fit_iv(d, s)
         columns = unique(s.core+s.controls)
         focus = s.core[0] if s.core else "const"
         details = {}

@@ -13,9 +13,9 @@ import statsmodels.api as sm
 
 from tihu_core import (VERSION, ModelSpec, apply_steps, binary, candidate_specs,
                        config_payload, fingerprint, fit_model, fixed_sample,
-                       grouped_moderation, infer_type, esr_identification_candidates,
+                       grouped_moderation, infer_type,
                        load_config, mechanism_analysis,
-                       mediation_bootstrap, rank_fit, required_columns, unique,
+                       mediation_bootstrap, rank_fit, required_columns, unique, effect_row,
                        validate_panel)
 from tihu_export import dta_bytes, reproducibility_bundle, stata_script
 
@@ -61,9 +61,93 @@ def display_table(table):
     st.dataframe(renamed, width="stretch", hide_index=True, column_config=formats)
 
 
-@st.cache_data(show_spinner=False)
-def cached_esr_identification_candidates(data, y, treatment, candidates):
-    return esr_identification_candidates(data, y, treatment, candidates)
+def instrument_picker(data, s, key, excluded=(), esr=False):
+    from tihu_iv import iv_candidates, esr_candidates
+    if not (s.treatment if esr else s.core):
+        return []
+    payload = json.dumps([asdict(s), list(excluded), list(data.columns), data.attrs], sort_keys=True, default=str)
+    digest = fingerprint(pd.util.hash_pandas_object(data, index=True).values.tobytes()+payload.encode())
+    cache = st.session_state.setdefault("_instrument_cache", {})
+    if digest not in cache:
+        with st.spinner("正在筛选识别变量" if esr else "正在筛选工具变量"):
+            cache[digest] = esr_candidates(data, s, excluded) if esr else iv_candidates(data, s, excluded)
+        while len(cache) > 4:
+            cache.pop(next(iter(cache)))
+    table = cache[digest]
+    eligible = table.loc[table["通过初筛"], "变量"].tolist()
+    if not eligible:
+        st.info("暂无识别变量通过 Probit 选择方程 p<0.05 初筛。" if esr else "暂无工具变量通过第一阶段 F>10 且 p<0.05 初筛。")
+        st.session_state.pop(key, None)
+        with st.expander("自动筛选明细"):
+            st.dataframe(table, hide_index=True, width="stretch")
+        return []
+    target = (s.model, s.y, s.treatment if esr else tuple(s.core))
+    target_key = "_instrument_target_"+key
+    if st.session_state.get(target_key) != target:
+        st.session_state.pop(key, None)
+        st.session_state[target_key] = target
+    if esr:
+        old = st.session_state.get(key)
+        if old and old not in eligible:
+            st.info("原识别变量不再通过当前设定的初筛，推荐已更新。")
+        selected = [choose("识别变量 Z（自动筛选，仅进入选择方程）", eligible, key)]
+    else:
+        old = st.session_state.get(key, [])
+        selected = [c for c in old if c in eligible]
+        if old and len(selected) != len(old):
+            st.info("部分工具变量不再通过当前设定的初筛，推荐已更新。")
+        st.session_state[key] = selected or eligible[:1]
+        selected = st.multiselect("工具变量 Z（自动筛选）", eligible, key=key)
+    with st.expander(f"候选排名 · {len(eligible)} 个通过初筛"):
+        st.dataframe(table[table["通过初筛"]], hide_index=True, width="stretch",
+                     column_config={"第一阶段 F": st.column_config.NumberColumn(format="%.2f"),
+                                    "相关性 p值": st.column_config.NumberColumn(format="%.4g")})
+        st.caption("ESR 使用 Probit 选择方程相关性检验，不套用 2SLS 的 F>10。" if esr else "普通标准误使用 F；稳健/聚类使用相应 Wald F。F>10 是经验强度筛选，不是通用弱识别临界值。")
+    st.caption("按当前必选控制及标准误初筛，组合搜索会逐组复核；通过初筛不等于已证明外生性与排除限制。")
+    return selected
+
+
+def iv_followup_panel(ws, baseline, prefix="follow_iv", excluded=()):
+    from tihu_iv import iv_followup_spec
+    if baseline.spec.model not in {"OLS", "Pooled OLS", "FE", "FE+RE", "LPM", "IV/2SLS"} or baseline.spec.interactions or not baseline.spec.core:
+        st.info("普通 2SLS 对照用于线性基准；DID、RD、ESR 及非线性模型需要各自的内生性设定。")
+        return
+    endog = baseline.spec.core[0] if len(baseline.spec.core) == 1 else choose("可能内生的 X", baseline.spec.core, prefix+"_x")
+    s = iv_followup_spec(baseline.spec, endog)
+    s.instruments = instrument_picker(baseline.sample, s, prefix+"_z", excluded)
+    token = fingerprint(pd.util.hash_pandas_object(baseline.sample, index=True).values.tobytes()
+                        +json.dumps(asdict(s), sort_keys=True, default=str).encode())
+    state = ws.setdefault(prefix, {})
+    if state.get("token") != token:
+        state.clear()
+        state["token"] = token
+    if st.button("运行 2SLS 对照", icon=":material/play_arrow:", disabled=not s.instruments, key=prefix+"_run"):
+        try:
+            iv = fit_model(baseline.sample, s)
+            same = fit_model(iv.sample, baseline.spec)
+            state["results"] = {"原基准": baseline, "同样本基准": same, "2SLS": iv}
+            state.pop("bundle", None)
+        except Exception as exc:
+            state.pop("results", None)
+            state.pop("bundle", None)
+            st.error(f"本次 2SLS 未成功：{exc}")
+    if state.get("results"):
+        fits = state["results"]
+        display_table(pd.DataFrame([{"分析": title, "N": len(fit.sample), **effect_row(fit.table, endog)} for title, fit in fits.items()]))
+        iv = fits["2SLS"]
+        for title, value in iv.details.items():
+            if isinstance(value, pd.DataFrame):
+                st.markdown(f"**{title}**")
+                display_table(value)
+            else:
+                st.caption(f"{title}：{value}")
+        do, _ = stata_script(iv.sample, [], iv)
+        with st.expander("Stata 复现代码"):
+            st.code(do, language="stata")
+        if st.button("生成 2SLS 复现包", icon=":material/download:", key=prefix+"_pack"):
+            state["bundle"] = reproducibility_bundle(iv.sample, [], iv, ws.get("hash", "session"))[0]
+        if state.get("bundle"):
+            st.download_button("下载 2SLS 复现包", state["bundle"], "tihu_iv.zip", "application/zip", key=prefix+"_download")
 
 
 def pipeline_panel(ws, raw):
@@ -245,27 +329,33 @@ def specification(data):
         models = ["OLS", "Tobit", "Sharp RD", "Fuzzy RD"]
         if bins:
             models += ["ESR", "Heckman"]
+    models += ["IV/2SLS"]
     if structure == "横截面":
-        models += ["IV/2SLS"] + (["PSM"] if bins else [])
+        models += ["PSM"] if bins else []
         if kind in {"连续", "受限连续"} and any(2 <= data[c].nunique() <= 20 for c in other):
             models += ["ANOVA", "交互效应"]
     model = choose("模型", models, "cfg_model")
     cat_default = [c for c in other if not pd.api.types.is_numeric_dtype(data[c])]
     cats = multiple("按分类变量处理", other, "cfg_categorical", cat_default)
     s = ModelSpec(model=model, y=y, categorical=cats, entity=entity, time=time_col)
+    preview_se = st.session_state.get("cfg_se", "聚类" if entity else "异方差稳健")
+    s.se = {"异方差稳健": "robust", "聚类": "cluster", "普通 / 信息矩阵": "ordinary"}.get(preview_se, "robust")
+    s.cluster = st.session_state.get("cfg_cluster", entity) if s.se == "cluster" else ""
+    screening_pool = [c for c in st.session_state.get("cfg_pool", []) if c in data]
+    screening_data = data.dropna(subset=screening_pool) if st.session_state.get("cfg_sample_mode", "固定").startswith("固定") else data
     if model in {"ANOVA", "交互效应"}:
         s.group = choose("分组变量", [c for c in other if 2 <= data[c].nunique() <= 20], "cfg_group")
         s.categorical = unique(s.categorical+[s.group])
         levels = sorted(data[s.group].dropna().astype(str).unique())
         st.caption(f"参考组：{levels[0]}")
         s.contrast = choose("比较组", levels[1:], "cfg_contrast")
-    if model in {"FE", "FE+RE"}:
+    if model in {"FE", "FE+RE"} or (model == "IV/2SLS" and entity):
         a, b = st.columns(2)
         with a:
             s.entity_effects = st.checkbox("个体固定效应", value=True, key="cfg_entity_effects")
         with b:
             s.time_effects = st.checkbox("时间固定效应", value=True, key="cfg_time_effects")
-        if not s.entity_effects and not s.time_effects:
+        if model != "IV/2SLS" and not s.entity_effects and not s.time_effects:
             st.warning("FE 至少需要选择个体固定效应或时间固定效应")
             return None
         if model == "FE+RE" and not s.entity_effects:
@@ -281,28 +371,9 @@ def specification(data):
             st.warning("请先将处理/选择变量明确编码为 0/1")
             return None
     if model == "ESR":
-        screened = cached_esr_identification_candidates(
-            data,
-            y,
-            s.treatment,
-            tuple(c for c in other if c != s.treatment),
-        )
-        eligible = screened["变量"].tolist()
-        if not eligible:
-            st.warning("没有变量同时通过识别变量筛选：与 D 相关 p<0.10，控制 D 后对 Y 的直接关系 p≥0.10。")
-            return None
-        exclusion = choose(
-            "识别变量 Z（仅进入选择方程）",
-            eligible,
-            "cfg_esr_exclusion",
-        )
-        if not exclusion:
-            st.warning("ESR 需要先选择一个识别变量")
-            return None
-        s.instruments = [exclusion]
-        with st.expander("识别变量筛选结果"):
-            st.dataframe(screened, hide_index=True, width="stretch")
-            st.caption("相关性使用稳健标准误的一阶段线性概率检验；排他性使用控制 D 后的无直接关系代理检验。")
+        s.controls = [c for c in st.session_state.get("cfg_controls", []) if c in other and c != s.treatment]
+        s.instruments = instrument_picker(screening_data, s, "cfg_esr_exclusion", screening_pool, esr=True)
+        s.auto_instrument = True
     if "DID" in model:
         post_mode = choose("Post 来源", ["政策时间", "已有 Post"], "cfg_post_mode")
         if post_mode == "已有 Post":
@@ -329,12 +400,22 @@ def specification(data):
     if model not in special or model == "Heckman":
         core_options = [c for c in selectable if c not in cats]
         if model == "IV/2SLS":
-            core = choose("内生变量", core_options, "cfg_endog")
+            previous_core = st.session_state.get("cfg_core", [])
+            core = choose("可能内生的 X", core_options, "cfg_endog", previous_core[0] if previous_core else "x")
             s.core = [core] if core else []
+            inherited = (st.session_state.get("workspace_v2", {}).get("hash"), y, tuple(previous_core), core)
+            if st.session_state.get("_iv_inherited_core") != inherited:
+                others = [c for c in previous_core if c != core and c in selectable]
+                st.session_state["cfg_controls"] = unique(st.session_state.get("cfg_controls", [])+others)
+                st.session_state["_iv_inherited_core"] = inherited
         else:
             s.core = multiple("核心 X", core_options, "cfg_core", core_options[:1])
     if model == "IV/2SLS":
-        s.instruments = multiple("排除工具变量", [c for c in selectable if c not in s.core], "cfg_instruments")
+        s.controls = [c for c in st.session_state.get("cfg_controls", []) if c in selectable and c not in s.core]
+        s.instruments = instrument_picker(screening_data, s, "cfg_instruments", screening_pool)
+        s.auto_instrument = True
+        if kind != "连续":
+            st.caption("本项估计线性工具变量模型，不是 IV-Probit、IV-Poisson 或受限因变量模型。")
     control_options = [c for c in selectable if c not in s.core+s.instruments]
     s.controls = multiple("必选控制变量", control_options, "cfg_controls")
     pool = multiple("候选控制变量", [c for c in control_options if c not in s.controls], "cfg_pool")
@@ -577,10 +658,15 @@ def followup_ui(ws, fit):
             except Exception as e:
                 st.error(str(e))
     with tabs[3]:
-        mode = choose("稳健性方式", ["仅核心 X 缩尾", "Y 缩尾", "替换 Y", "替换核心 X", "按变量范围筛选"], "follow_robust")
+        methods = ["仅核心 X 缩尾", "Y 缩尾", "替换 Y", "替换核心 X", "按变量范围筛选"]
+        if s.model in {"OLS", "Pooled OLS", "FE", "FE+RE", "LPM", "IV/2SLS"} and s.core and not s.interactions:
+            methods.append("内生性处理：2SLS")
+        mode = choose("稳健性方式", methods, "follow_robust")
         pct = .01
         replacement = None
-        if "缩尾" in mode:
+        if mode == "内生性处理：2SLS":
+            iv_followup_panel(ws, fit)
+        elif "缩尾" in mode:
             pct = st.select_slider("缩尾比例", options=[.01, .05, .1], format_func=lambda v: f"{v*100:g}%", key="follow_pct")
         elif mode in {"替换 Y", "替换核心 X"}:
             replacement = choose("替换变量", [c for c in sample.select_dtypes(include="number") if not c.startswith("__")], "follow_replacement")
@@ -588,7 +674,7 @@ def followup_ui(ws, fit):
             replacement = choose("筛选变量", [c for c in sample.select_dtypes(include="number") if not c.startswith("__")], "follow_filter")
             lo = number("保留 ≥", "follow_lower", float(sample[replacement].min())) if replacement else 0
             hi = number("保留 ≤", "follow_upper", float(sample[replacement].max())) if replacement else 0
-        if st.button("运行稳健性分析", key="run_robust"):
+        if mode != "内生性处理：2SLS" and st.button("运行稳健性分析", key="run_robust"):
             try:
                 changed = sample.copy(deep=True)
                 candidate = s

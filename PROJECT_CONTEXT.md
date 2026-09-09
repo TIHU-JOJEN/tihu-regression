@@ -1,6 +1,6 @@
 # 鹈鹕回归项目说明
 
-更新日期：2026-09-07
+更新日期：2026-09-09
 
 ## 部署入口
 
@@ -9,9 +9,11 @@
 - 首页模式选择、新手模式与有预算的自动任务：`tihu_novice.py`
 - 清洗、变量加工、模型估计与后续分析：`tihu_core.py`
 - Stata/Python 复现包：`tihu_export.py`
+- 工具变量候选筛选、ESR Probit 识别变量检验、吸收固定效应的 2SLS：`tihu_iv.py`
 - 合成数据测试：`test_tihu.py`
 - 新手分流、模式隔离、自动后续分析及导出测试：`test_novice.py`
 - 专家搜索预算、批处理、停止恢复及任意组合载入测试：`test_expert_search.py`
+- 工具变量强度、FE-IV、模型隔离与两个入口测试：`test_instruments.py`
 - 本机 Stata 对照测试：`verify_stata.py`
 
 Streamlit Community Cloud 从仓库根目录运行 `panel_app.py`。更新依赖时同时修改 `requirements.txt`。
@@ -43,7 +45,13 @@ Streamlit Community Cloud 从仓库根目录运行 `panel_app.py`。更新依赖
 - 横截面：OLS、Logit/Probit/LPM、有序模型、Poisson/负二项、Tobit、Heckman、PSM、IV/2SLS、Sharp/Fuzzy RD、ANOVA/交互效应、ESR。
 - 面板：FE、RE、FE+RE、Pooled OLS、DID、PSM-DID，以及适合结果类型的基础模型。FE 可分别选择个体固定效应、时间固定效应或双向固定效应；DID 始终保留个体固定效应。
 - 时间序列：ARIMA、AR、MA、ARMA、VAR、GARCH，并提供动态机制和调节分析。
-- ESR 首版范围：横截面、连续 Y、0/1 选择变量。识别变量列表仅显示同时通过相关性检验和无直接关系代理检验的变量；每个候选控制组合同时进入两个结果方程和选择方程，识别变量仅进入选择方程。网页与导出的 Stata 代码均使用同一高斯完整信息最大似然；ATT/ATU 使用 Delta 法。
+- ESR 范围：横截面、连续 Y、0/1 选择变量。选定 Y、D 后自动筛选 Z，使用当前控制变量和协方差设定下 Probit 选择方程的 Wald 检验，p<0.05 才进入候选列表。不套用 2SLS 的 F>10；已删除“控制 D 后对 Y 不显著”的排他性代理。每个控制组合同时进入两个结果方程和选择方程，Z 仅进入选择方程，并逐组复核相关性。联合似然与 ATT/ATU 估计方法不变。
+- 2SLS 基准入口同时出现在横截面与面板分支。当前支持一个待工具化的 X，可选择多个自动筛选的 Z；由普通多 X 基准切换时，其他 X 初次带入必选外生控制，可手动调整。Y、X 选好后自动推荐，按对应控制、样本与固定效应计算普通 F / 稳健 Wald F / 聚类 Wald F，以 F>10 且 p<0.05 初筛；“F>10”不是通用弱识别临界值，也不是外生性/排除限制的证明。
+- 2SLS 与 ESR 使用独立的筛选函数、阈值、控件状态；只向用户提供通过初筛的候选。默认推荐排名第一项，用户可直接接受或选择其他候选，无额外确认流程。候选池排除已指定角色、纯编号、高基数非数值列、常量、完全共线项和本平台记录的 Y/X 加工谱系。筛选不使用 Y 方程不显著作为有效性认证，不自动构造滞后或组均值工具。
+- 自动候选结果仅缓存在当前会话，最多四份摘要；内容、样本、控制、聚类/固定效应等变化时重新筛选。固定样本搜索初筛同时考虑候选控制池的完整行；每个实际控制组合再复核。`ModelSpec.auto_instrument=True` 标识 UI 自动筛选路径，保证控制组合改变后不会沿用过期的通过状态。
+- 线性基准的“稳健性方式”增加“内生性处理：2SLS”；新手 OLS/FE 结果新增“内生性处理”页签。两者共用 `iv_followup_panel`，自动继承当前模型、控制、聚类与固定效应，并显示原基准、同样本基准和 2SLS 对照。DID/RD/ESR/非线性或含内生交互项的模型不会被机械转换成普通 2SLS。
+- FE-IV 用 PyHDFE 吸收固定效应，用线性 IV 库估计；有限样本自由度按完整虚拟变量模型校正，与导出的 `ivregress ... i.FE ..., small` 对照。结果包含第一阶段、控制函数内生性检验与适用的过度识别检验；聚类过度识别暂交由导出 Stata 代码计算，不把普通检验充当聚类检验。恰好识别明确标为不可做过度识别检验。
+- IV/ESR 复现包增加诊断 CSV 和 `diagnostics.json`，含 `tihu_iv.py` 与 PyHDFE 依赖。Stata 同时生成与筛选对应的第一阶段/Probit 检验和最终估计代码，代码可直接展开复制。
 
 ## 关键规则
 
@@ -70,7 +78,7 @@ Streamlit Community Cloud 从仓库根目录运行 `panel_app.py`。更新依赖
 运行：
 
 ```bash
-python3 -m unittest test_tihu test_novice test_expert_search -v
+python3 -m unittest test_tihu test_novice test_expert_search test_instruments -v
 ```
 
 本机安装 Stata 时可运行：
@@ -78,6 +86,7 @@ python3 -m unittest test_tihu test_novice test_expert_search -v
 ```bash
 python3 verify_stata.py
 python3 verify_stata.py --novice-only
+python3 verify_stata.py --iv-only
 ```
 
 2026-09-07 验证：24 项自动测试通过，包含 10,000 组硬预算、多个 X 均衡分配、无重复/可重复抽样、穷尽、小预算、界面停止/继续及更改范围后的结果失效。新手四条模型路线的 20 项主模型、中介路径和调节回归此前通过本机 Stata 系数/标准误对照（本次未修改估计公式）。真实浏览器使用合成 CSV 验证上传、自动运行、后续分析、整包导出、模式切换恢复，以及桌面和 390px 手机布局。
@@ -85,6 +94,8 @@ python3 verify_stata.py --novice-only
 可选性能测试：`python3 benchmark_novice.py`。本机 400 行合成数据、15 个候选控制变量、每组 6–10 项、1 个 X 的 10,000 次稳健 OLS 全部成功，纯计算约 32.12 秒、进程峰值内存约 187 MiB。该数值不包含网页刷新等待，不代表 Streamlit 云端、多用户或大样本/非线性模型的运行承诺。
 
 专家搜索更新验证：上述测试现共 27 项通过。`python3 benchmark_novice.py --expert` 使用相同合成数据完成 10,000 次有效 OLS，纯计算约 33.00 秒、进程峰值内存约 196 MiB；同时保留全部 10,000 条成功摘要和前 50 个完整结果。
+
+2026-09-09 自动工具变量更新：33 项自动测试通过。12 组横截面/个体 FE/时间 FE/双向 FE × 普通/稳健/聚类 2SLS 的系数和标准误通过本机 Stata 数值对照。浏览器验证专家基准 IV、稳健性 IV 对照及下载、ESR 独立选择器、新手 FE-IV，以及 390px 手机布局。全程只使用合成数据。
 
 测试只生成合成数据。当前对照覆盖 OLS 普通/稳健/聚类、Logit、Poisson、FE、RE、DID、Tobit、Heckman、IV、Sharp/Fuzzy RD，以及 ESR 的 ATT/ATU 与稳健标准误。
 
