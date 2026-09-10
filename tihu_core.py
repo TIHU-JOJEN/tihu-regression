@@ -17,7 +17,7 @@ from statsmodels.miscmodels.ordinal_model import OrderedModel
 from linearmodels.iv import IV2SLS
 from linearmodels.panel import PanelOLS, RandomEffects
 
-VERSION = "2026.09.09"
+VERSION = "2026.09.10"
 
 
 def unique(values):
@@ -397,13 +397,14 @@ def fit_model(data, spec):
         d = frame(data, s)
         if s.model == "ESR":
             if s.auto_instrument:
-                from tihu_iv import esr_test
-                check = esr_test(d, s, s.instruments)
+                from tihu_iv import instrument_test, identification_report
+                check, _ = instrument_test(d, s)
                 if not check["通过初筛"]:
                     raise ValueError("当前控制组合的识别变量未通过 Probit 选择方程 p<0.05 初筛")
             result = fit_esr(d, s)
             if s.auto_instrument:
-                result.details["识别变量检验"] = pd.DataFrame([check])
+                result.details["识别诊断报告"] = identification_report(check)
+                result.details["识别变量检验"] = pd.DataFrame([{k: check[k] for k in ["选择方程 Wald χ²", "相关性 p值", "有效样本", "检验", "通过初筛"]}])
             return result
         if s.model == "IV/2SLS":
             from tihu_iv import fit_iv

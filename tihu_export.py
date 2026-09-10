@@ -153,7 +153,9 @@ def stata_model(fit, names):
                 effects.append("i.__iv_time")
         lines += [f"regress {n(s.core[0])} {terms(s.controls)} {' '.join(effects)} {terms(s.instruments)}{option}",
                   f"testparm {terms(s.instruments)}", "scalar __firststage_F = r(F)",
-                  "* F > 10 is a relevance screen, not proof of instrument exogeneity.",
+                  "* Shared identification workflow: conditional relevance, strength, exclusion/exogeneity.",
+                  "* F > 10 is a heuristic screen, not a universal weak-ID critical value.",
+                  "* Exclusion and exogeneity require substantive justification; they are not certified here.",
                   f"ivregress 2sls {y} {terms(s.controls)} {' '.join(effects)} ({n(s.core[0])}={terms(s.instruments)}), small {vce}",
                   "estat firststage", "capture noisily estat endogenous", "capture estat overid"]
     elif s.model == "Tobit":
@@ -167,7 +169,9 @@ def stata_model(fit, names):
         z, x0, x1, treatment = terms(s.selection), terms(s.regime0 or s.controls), terms(s.regime1 or s.controls), n(s.treatment)
         if s.auto_instrument and s.instruments:
             lines += [f"probit {treatment} {z}{option}", f"testparm {terms(s.instruments)}",
-                      "* Probit relevance test for ESR; do not apply the 2SLS F > 10 rule."]
+                      "* Shared identification workflow: conditional relevance, strength, exclusion/exogeneity.",
+                      "* Probit relevance is not proof of strong identification; do not apply the 2SLS F > 10 rule.",
+                      "* Exclusion and exogeneity require substantive justification; they are not certified here."]
         lines += [
             "* Full-information Gaussian endogenous switching likelihood; no movestay dependency.",
             "capture program drop tihu_esr_ll", "program define tihu_esr_ll", "    version 16",

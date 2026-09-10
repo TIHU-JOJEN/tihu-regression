@@ -61,25 +61,29 @@ def display_table(table):
     st.dataframe(renamed, width="stretch", hide_index=True, column_config=formats)
 
 
-def instrument_picker(data, s, key, excluded=(), esr=False):
-    from tihu_iv import iv_candidates, esr_candidates
+def instrument_picker(data, s, key, excluded=()):
+    from tihu_iv import instrument_candidates, identification_report
+    esr = s.model == "ESR"
     if not (s.treatment if esr else s.core):
         return []
-    payload = json.dumps([asdict(s), list(excluded), list(data.columns), data.attrs], sort_keys=True, default=str)
+    payload = json.dumps(["shared-screen-v1", asdict(s), list(excluded), list(data.columns), data.attrs], sort_keys=True, default=str)
     digest = fingerprint(pd.util.hash_pandas_object(data, index=True).values.tobytes()+payload.encode())
     cache = st.session_state.setdefault("_instrument_cache", {})
     if digest not in cache:
         with st.spinner("正在筛选识别变量" if esr else "正在筛选工具变量"):
-            cache[digest] = esr_candidates(data, s, excluded) if esr else iv_candidates(data, s, excluded)
+            cache[digest] = instrument_candidates(data, s, excluded)
         while len(cache) > 4:
             cache.pop(next(iter(cache)))
     table = cache[digest]
+    visible = ["变量", "检验", "统计量", "相关性 p值", "有效样本", "通过初筛"]
+    formats = {"统计量": st.column_config.NumberColumn(format="%.2f"),
+               "相关性 p值": st.column_config.NumberColumn(format="%.4g")}
     eligible = table.loc[table["通过初筛"], "变量"].tolist()
     if not eligible:
         st.info("暂无识别变量通过 Probit 选择方程 p<0.05 初筛。" if esr else "暂无工具变量通过第一阶段 F>10 且 p<0.05 初筛。")
         st.session_state.pop(key, None)
         with st.expander("自动筛选明细"):
-            st.dataframe(table, hide_index=True, width="stretch")
+            st.dataframe(table[visible], hide_index=True, width="stretch", column_config=formats)
         return []
     target = (s.model, s.y, s.treatment if esr else tuple(s.core))
     target_key = "_instrument_target_"+key
@@ -99,10 +103,12 @@ def instrument_picker(data, s, key, excluded=(), esr=False):
         st.session_state[key] = selected or eligible[:1]
         selected = st.multiselect("工具变量 Z（自动筛选）", eligible, key=key)
     with st.expander(f"候选排名 · {len(eligible)} 个通过初筛"):
-        st.dataframe(table[table["通过初筛"]], hide_index=True, width="stretch",
-                     column_config={"第一阶段 F": st.column_config.NumberColumn(format="%.2f"),
-                                    "相关性 p值": st.column_config.NumberColumn(format="%.4g")})
-        st.caption("ESR 使用 Probit 选择方程相关性检验，不套用 2SLS 的 F>10。" if esr else "普通标准误使用 F；稳健/聚类使用相应 Wald F。F>10 是经验强度筛选，不是通用弱识别临界值。")
+        st.dataframe(table.loc[table["通过初筛"], visible], hide_index=True, width="stretch", column_config=formats)
+        check = table.iloc[0]
+        st.markdown("**共同诊断口径**")
+        st.dataframe(identification_report(check).loc[1:, ["诊断环节", "依据"]], hide_index=True, width="stretch")
+        if not esr:
+            st.caption("多个 Z 的联合检验以最终回归结果为准；候选表为逐项初筛。")
     st.caption("按当前必选控制及标准误初筛，组合搜索会逐组复核；通过初筛不等于已证明外生性与排除限制。")
     return selected
 
@@ -372,7 +378,7 @@ def specification(data):
             return None
     if model == "ESR":
         s.controls = [c for c in st.session_state.get("cfg_controls", []) if c in other and c != s.treatment]
-        s.instruments = instrument_picker(screening_data, s, "cfg_esr_exclusion", screening_pool, esr=True)
+        s.instruments = instrument_picker(screening_data, s, "cfg_esr_exclusion", screening_pool)
         s.auto_instrument = True
     if "DID" in model:
         post_mode = choose("Post 来源", ["政策时间", "已有 Post"], "cfg_post_mode")

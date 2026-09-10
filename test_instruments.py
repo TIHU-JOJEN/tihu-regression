@@ -1,5 +1,6 @@
-"""Synthetic validation of separate IV and ESR recommendation pipelines."""
+"""Synthetic validation of the shared, model-aware identification workflow."""
 import io
+import json
 import unittest
 import zipfile
 from dataclasses import replace
@@ -9,7 +10,8 @@ import statsmodels.api as sm
 from linearmodels.iv import IV2SLS
 from streamlit.testing.v1 import AppTest
 from tihu_core import ModelSpec, fit_model, apply_steps, covariance_options
-from tihu_iv import iv_candidates, esr_candidates, first_stage, iv_followup_spec
+from tihu_iv import (iv_candidates, esr_candidates, first_stage, iv_followup_spec,
+                     instrument_candidates, instrument_test, identification_report)
 from tihu_export import reproducibility_bundle
 
 
@@ -27,6 +29,70 @@ def instrument_data(n=800):
 
 
 class InstrumentTests(unittest.TestCase):
+    def test_shared_report_with_model_specific_statistics(self):
+        d = instrument_data()
+        reports = []
+        for model in ["IV/2SLS", "ESR"]:
+            s = ModelSpec(model, "y", ["x"] if model == "IV/2SLS" else [], ["c"], treatment="D")
+            check, _ = instrument_test(d, s, ["z"])
+            table = instrument_candidates(d, s).set_index("变量")
+            for col in ["检验", "统计量", "相关性 p值", "通过初筛", "外生性与排除限制"]:
+                self.assertEqual(table.loc["z", col], check[col])
+            self.assertEqual(check["外生性与排除限制"], "待论证")
+            reports.append(identification_report(check))
+            if model == "IV/2SLS":
+                self.assertEqual(check["统计量"], check["第一阶段 F"])
+            else:
+                self.assertEqual(check["统计量"], check["选择方程 Wald χ²"])
+                self.assertIn("未判定", check["强度结论"])
+                self.assertNotIn("第一阶段 F", check)
+        self.assertEqual(list(reports[0].columns), list(reports[1].columns))
+        self.assertEqual(list(reports[0]["诊断环节"]), list(reports[1]["诊断环节"]))
+        with self.assertRaises(ValueError):
+            instrument_candidates(d, replace(s, model="Probit"))
+
+    def test_esr_joint_test_and_covariance(self):
+        d = instrument_data()
+        for se in ["ordinary", "robust", "cluster"]:
+            s = ModelSpec("ESR", "y", controls=["c"], treatment="D", se=se, cluster="id")
+            check, _ = instrument_test(d, s, ["z", "z2"])
+            kw = covariance_options(s, d)
+            kw.pop("use_t", None)
+            expected = sm.Probit(d.D, sm.add_constant(d[["c", "z", "z2"]])).fit(disp=False, **kw)
+            test = expected.wald_test("z=0,z2=0", scalar=True)
+            self.assertAlmostEqual(check["统计量"], float(test.statistic), places=8)
+            self.assertAlmostEqual(check["相关性 p值"], float(test.pvalue), places=8)
+            self.assertIn("Probit", check["检验"])
+
+    def test_esr_invalid_roles_and_treatment_lineage(self):
+        d = instrument_data()
+        s = ModelSpec("ESR", "y", controls=["c"], treatment="D")
+        for instruments in [[], ["y"], ["D"], ["c"]]:
+            with self.assertRaises(ValueError):
+                instrument_test(d, s, instruments)
+        processed, _ = apply_steps(d, [{"op": "square", "cols": ["D"], "name": "D2"}])
+        self.assertNotIn("D2", instrument_candidates(processed, s)["变量"].tolist())
+        d.loc[d.D == 0, "z"] = np.nan
+        with self.assertRaises(ValueError):
+            instrument_test(d, s, ["z"])
+
+    def test_same_diagnostics_in_fits_and_replay_bundle(self):
+        d = instrument_data(200)
+        for model in ["IV/2SLS", "ESR"]:
+            s = ModelSpec(model, "y", ["x"] if model == "IV/2SLS" else [], ["c"], treatment="D",
+                          instruments=["z"], selection=["c", "z"], auto_instrument=True)
+            fit = fit_model(d, s)
+            check, _ = instrument_test(fit.sample, s)
+            pd.testing.assert_frame_equal(fit.details["识别诊断报告"], identification_report(check))
+            packed, do = reproducibility_bundle(d, [], fit, "synthetic")
+            self.assertIn("Shared identification workflow", do)
+            with zipfile.ZipFile(io.BytesIO(packed)) as archive:
+                index = json.loads(archive.read("diagnostics.json"))
+                saved = pd.read_csv(io.BytesIO(archive.read(index["识别诊断报告"])))
+            pd.testing.assert_frame_equal(saved, identification_report(check))
+            with self.assertRaises(ValueError):
+                fit_model(d, replace(s, instruments=["weak"], selection=["c", "weak"]))
+
     def test_recommendation_is_conditional_and_not_y_significance(self):
         d = instrument_data()
         s = ModelSpec("IV/2SLS", "y", ["x"], ["c"])

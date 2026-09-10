@@ -1,4 +1,4 @@
-"""Model-specific instrument screening and linear IV estimation, without I/O."""
+"""Shared identification workflow with model-aware tests, without I/O."""
 from dataclasses import replace
 import warnings
 import numpy as np
@@ -16,7 +16,8 @@ def candidates(data, s, excluded=()):
     blocked = set(unique([s.y, s.entity, s.time, s.cluster, s.treatment, s.post, s.running, s.group]
                          +s.core+s.controls+list(excluded)))
     lineage = data.attrs.get("tihu_lineage", {})
-    family = set([s.y]+s.core+lineage.get(s.y, [])+[source for c in s.core for source in lineage.get(c, [])])
+    targets = unique([s.y, s.treatment]+s.core)
+    family = set(targets+[source for c in targets for source in lineage.get(c, [])])
     blocked.update(family)
     for col, sources in lineage.items():
         if family.intersection(sources):
@@ -111,30 +112,20 @@ def first_stage(data, s, arrays=None):
             "检验": kind, "通过初筛": bool(np.isfinite(f) and f > 10 and p < .05)}, result
 
 
-def iv_candidates(data, s, excluded=()):
-    rows = []
-    for col in candidates(data, s, excluded):
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                row, _ = first_stage(data, replace(s, instruments=[col]))
-            rows.append({"变量": col, **row})
-        except (ValueError, np.linalg.LinAlgError, ZeroDivisionError, PerfectSeparationError, FloatingPointError):
-            continue
-    columns = ["变量", "第一阶段 F", "相关性 p值", "偏 R²", "有效样本", "检验", "通过初筛"]
-    return pd.DataFrame(rows, columns=columns).sort_values("第一阶段 F", ascending=False)
-
-
 def esr_test(data, s, instruments):
     if s.entity:
         raise ValueError("ESR 识别变量筛选仅用于横截面选择方程")
+    if not instruments or set(instruments) & set(s.controls+[s.y, s.treatment]):
+        raise ValueError("ESR 识别变量必须独立于 Y、D 和结果方程控制变量")
     if not binary(data[s.treatment]):
         raise ValueError("ESR 的 D 必须同时包含 0 和 1")
     d = frame(data, replace(s, instruments=list(instruments), selection=unique(s.controls+list(instruments))))
     x = design(d, s.controls+list(instruments), s.categorical)
     z = design(d, instruments, s.categorical, constant=False)
-    if min(d[s.treatment].value_counts()) < 10:
+    if not binary(d[s.treatment]) or min(d[s.treatment].value_counts()) < 10:
         raise ValueError("选择组或未选择组有效样本不足")
+    if z.empty or len(d) <= x.shape[1]+3 or np.linalg.matrix_rank(x) < x.shape[1]:
+        raise ValueError("选择方程样本不足或识别变量与控制变量完全共线")
     kw = covariance_options(s, d)
     kw.pop("use_t", None)
     result = sm.Probit(d[s.treatment], x).fit(disp=False, maxiter=100, **kw)
@@ -149,24 +140,70 @@ def esr_test(data, s, instruments):
             "有效样本": len(d), "通过初筛": bool(np.isfinite(p) and p < .05)}
 
 
-def esr_candidates(data, s, excluded=()):
+def instrument_test(data, s, instruments=None, arrays=None):
+    """Return the same diagnostic fields for screening and final-model rechecks."""
+    if instruments is not None:
+        s = replace(s, instruments=list(instruments))
+    if s.model == "IV/2SLS":
+        row, result = first_stage(data, s, arrays)
+        statistic = row["第一阶段 F"]
+        equation, kind = "X 的线性第一阶段", row["检验"]
+        strength = "达到 F>10 经验阈值" if statistic > 10 else "未达到 F>10 经验阈值"
+        rule = "F>10 且 p<0.05；F>10 不是通用弱识别临界值"
+    elif s.model == "ESR":
+        row, result = esr_test(data, s, s.instruments), None
+        statistic = row["选择方程 Wald χ²"]
+        equation = "D 的 Probit 选择方程"
+        kind = {"ordinary": "Probit Wald χ²", "robust": "Probit 稳健 Wald χ²", "cluster": "Probit 聚类 Wald χ²"}[s.se]
+        strength = "未判定；相关性显著不等于强识别"
+        rule = "Probit 联合 Wald p<0.05；不套用线性第一阶段 F>10"
+    else:
+        raise ValueError("本识别诊断仅用于 IV/2SLS 与 ESR，不自动转换其他模型")
+    return {**row, "筛选方程": equation, "检验": kind, "统计量": statistic,
+            "相关性结论": "通过 p<0.05" if row["相关性 p值"] < .05 else "未通过 p<0.05",
+            "强度结论": strength, "外生性与排除限制": "待论证", "初筛规则": rule}, result
+
+
+def identification_report(check):
+    return pd.DataFrame([
+        {"诊断环节": "条件相关性", "依据": check["筛选方程"]+"；"+check["检验"], "结论": check["相关性结论"]},
+        {"诊断环节": "识别强度", "依据": check["初筛规则"], "结论": check["强度结论"]},
+        {"诊断环节": "外生性与排除限制", "依据": "须结合变量来源与作用路径，不能由相关性或对 Y 不显著自动证明", "结论": check["外生性与排除限制"]},
+    ])
+
+
+def instrument_candidates(data, s, excluded=()):
+    if s.model not in {"IV/2SLS", "ESR"}:
+        raise ValueError("本识别诊断仅用于 IV/2SLS 与 ESR")
     rows = []
     for col in candidates(data, s, excluded):
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                row = esr_test(data, s, [col])
+                row, _ = instrument_test(data, s, [col])
             rows.append({"变量": col, **row})
         except (ValueError, np.linalg.LinAlgError, ZeroDivisionError, PerfectSeparationError, FloatingPointError):
             continue
-    columns = ["变量", "选择方程 Wald χ²", "相关性 p值", "有效样本", "通过初筛"]
-    return pd.DataFrame(rows, columns=columns).sort_values("相关性 p值")
+    columns = ["变量", "筛选方程", "检验", "统计量", "相关性 p值", "有效样本", "通过初筛",
+               "相关性结论", "强度结论", "外生性与排除限制", "初筛规则"]
+    columns += ["第一阶段 F", "偏 R²"] if s.model == "IV/2SLS" else ["选择方程 Wald χ²"]
+    table = pd.DataFrame(rows, columns=columns)
+    sort = "第一阶段 F" if s.model == "IV/2SLS" else "相关性 p值"
+    return table.sort_values(sort, ascending=s.model == "ESR", kind="stable")
+
+
+def iv_candidates(data, s, excluded=()):
+    return instrument_candidates(data, replace(s, model="IV/2SLS"), excluded)
+
+
+def esr_candidates(data, s, excluded=()):
+    return instrument_candidates(data, replace(s, model="ESR"), excluded)
 
 
 def fit_iv(data, s):
     arrays = iv_arrays(data, s)
     d, y, x, endog, z, absorbed, removed = arrays
-    stage, first = first_stage(data, s, arrays)
+    stage, first = instrument_test(data, s, arrays=arrays)
     if s.auto_instrument and not stage["通过初筛"]:
         raise ValueError("当前控制组合的第一阶段未通过 F>10 且 p<0.05 初筛")
     kw = {"cov_type": "robust" if s.se == "robust" else "unadjusted", "debiased": True}
@@ -183,7 +220,8 @@ def fit_iv(data, s):
     table = pd.DataFrame({"term": r.params.index, "coef": r.params.values, "se": se.values,
                           "p": 2*stats.t.sf(np.abs(r.params/se), df_test),
                           "lower": (r.params-quantile*se).values, "upper": (r.params+quantile*se).values})
-    details = {"第一阶段": pd.DataFrame([stage]), "说明": "F>10 是强度初筛，不是外生性或排除限制的证明。"}
+    details = {"识别诊断报告": identification_report(stage),
+               "第一阶段": pd.DataFrame([{k: stage[k] for k in ["第一阶段 F", "相关性 p值", "偏 R²", "有效样本", "检验", "通过初筛"]}])}
     if absorbed:
         details["固定效应自由度"] = absorbed
         details["被吸收的外生项"] = "、".join(removed)
