@@ -17,6 +17,32 @@ def job_for(data, specs):
 
 
 class ExpertSearchTests(unittest.TestCase):
+    def test_switch_from_household_head_to_respondent_id(self):
+        script = '''import streamlit as st
+from io import BytesIO
+from unittest.mock import patch
+from test_tihu import panel
+from tihu_ui import render_workbench
+d = panel()
+d.insert(0, "户主", d["id"] // 2)
+d.insert(1, "受访者", d["id"])
+d = d.drop(columns="id")
+upload = BytesIO(d.to_csv(index=False).encode()); upload.name = "synthetic_household.csv"
+with patch("streamlit.file_uploader", side_effect=lambda *a, **kw: upload if kw.get("key") == "data_upload" else None):
+    render_workbench()
+'''
+        app = AppTest.from_string(script, default_timeout=60).run()
+        app.selectbox(key="cfg_structure").select("面板").run()
+        self.assertEqual(app.selectbox(key="cfg_entity").value, "户主")
+        app.selectbox(key="cfg_entity").select("受访者").run()
+        self.assertEqual(app.selectbox(key="cfg_time").value, "year")
+        app.selectbox(key="cfg_y").select("y").run()
+        app.multiselect(key="cfg_core").set_value(["x"]).run()
+        app.number_input(key="cfg_budget").set_value(1).run()
+        app.button(key="run_search").click().run()
+        self.assertEqual(list(app.exception), [])
+        self.assertEqual(app.session_state["workspace_v2"]["job"]["specs"][0].entity, "受访者")
+
     def test_panel_columns_can_be_changed_to_numeric_text_time(self):
         script = '''import streamlit as st
 from test_tihu import panel

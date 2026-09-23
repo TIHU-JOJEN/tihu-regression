@@ -298,7 +298,7 @@ def specification(data):
         with a:
             entity = choose("个体 ID", cols, "cfg_entity", suggested_entity)
         with b:
-            time_col = choose("时间", [c for c in cols if c != entity], "cfg_time", suggested_time)
+            time_col = choose("时间", cols, "cfg_time", suggested_time)
         try:
             data = prepare_panel_time(data, time_col)
             validate_panel(data, entity, time_col)

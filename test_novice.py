@@ -146,6 +146,30 @@ with patch("streamlit.file_uploader", return_value=upload): render_novice()
         self.assertEqual(list(app.exception), [])
         self.assertIsNotNone(app.selectbox(key="nv_y"))
 
+    def test_switch_from_household_head_to_respondent_id(self):
+        script = '''import streamlit as st
+from io import BytesIO
+from unittest.mock import patch
+from test_tihu import panel
+from tihu_novice import render_novice
+d = panel()
+d.insert(0, "户主", d["id"] // 2)
+d.insert(1, "受访者", d["id"])
+d = d.drop(columns="id")
+upload = BytesIO(d.to_csv(index=False).encode()); upload.name = "synthetic_household.csv"
+with patch("streamlit.file_uploader", return_value=upload): render_novice()
+'''
+        app = AppTest.from_string(script, default_timeout=60).run()
+        app.checkbox(key="nv_panel").check().run()
+        app.selectbox(key="nv_time").select("year").run()
+        app.selectbox(key="nv_entity").select("受访者").run()
+        self.assertEqual(app.selectbox(key="nv_time").value, "year")
+        app.selectbox(key="nv_y").select("y").run()
+        app.multiselect(key="nv_core").set_value(["x"]).run()
+        app.button(key="nv_run").click().run()
+        self.assertEqual(list(app.exception), [])
+        self.assertEqual(app.session_state["novice_workspace"]["job"]["specs"][0].entity, "受访者")
+
     def test_panel_time_conversion_keeps_upload_unchanged(self):
         d = panel()
         d["text_year"] = d["year"].astype(str)

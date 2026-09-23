@@ -325,7 +325,7 @@ def render_novice():
         with a:
             entity = choose("个体 ID", data.columns, "nv_entity", entity)
         with b:
-            time = choose("时间列", [c for c in data if c != entity], "nv_time", time)
+            time = choose("时间列", data.columns, "nv_time", time)
         try:
             data = prepare_panel_time(data, time)
             validate_panel(data, entity, time)
