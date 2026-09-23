@@ -140,8 +140,8 @@ upload = BytesIO(d.to_csv(index=False).encode()); upload.name = "ambiguous.csv"
 with patch("streamlit.file_uploader", return_value=upload): render_novice()
 '''
         app = AppTest.from_string(script, default_timeout=60).run()
-        self.assertEqual(app.checkbox(key="nv_panel").value, False)
-        app.checkbox(key="nv_panel").check().run()
+        self.assertEqual(app.radio(key="nv_structure").value, "横截面")
+        app.radio(key="nv_structure").set_value("面板").run()
         app.selectbox(key="nv_time").select("period_code").run()
         self.assertEqual(list(app.exception), [])
         self.assertIsNotNone(app.selectbox(key="nv_y"))
@@ -160,7 +160,7 @@ upload = BytesIO(d.to_csv(index=False).encode()); upload.name = "synthetic_house
 with patch("streamlit.file_uploader", return_value=upload): render_novice()
 '''
         app = AppTest.from_string(script, default_timeout=60).run()
-        app.checkbox(key="nv_panel").check().run()
+        app.radio(key="nv_structure").set_value("面板").run()
         app.selectbox(key="nv_time").select("year").run()
         app.selectbox(key="nv_entity").select("受访者").run()
         self.assertEqual(app.selectbox(key="nv_time").value, "year")

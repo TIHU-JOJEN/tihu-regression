@@ -318,8 +318,10 @@ def render_novice():
     st.caption(f"{len(data):,} 条记录 · {len(data.columns)} 个变量 · {'需要确认数据结构' if structure == '待确认' else '识别为'+structure+'数据'}")
     with st.expander("数据预览"):
         st.dataframe(data.head(8), hide_index=True, width="stretch")
-    panel = st.checkbox("按面板数据分析（同一个体跨期记录）", value=structure == "面板" or did,
-                        disabled=did, key="nv_panel") or did
+    if "nv_structure" not in st.session_state and "nv_panel" in st.session_state:
+        st.session_state["nv_structure"] = "面板" if st.session_state["nv_panel"] else "横截面"
+    panel = did or st.radio("数据结构", ["横截面", "面板"], index=1 if structure == "面板" else 0,
+                            horizontal=True, key="nv_structure") == "面板"
     if panel:
         a, b = st.columns(2)
         with a:
@@ -360,7 +362,7 @@ def render_novice():
         minimum, maximum = st.slider("每组控制变量个数", 0, 10, (0, 10), key="nv_control_range")
         budget = st.number_input("主模型搜索预算（全部核心因素合计）", min_value=1, max_value=10000,
                                  value=10000, step=100, key="nv_budget")
-    setting_keys = ["nv_did", "nv_panel", "nv_entity", "nv_time", "nv_y", "nv_treat", "nv_policy", "nv_core", "nv_mediators", "nv_moderators", "nv_pool", "nv_control_range", "nv_budget"]
+    setting_keys = ["nv_did", "nv_structure", "nv_entity", "nv_time", "nv_y", "nv_treat", "nv_policy", "nv_core", "nv_mediators", "nv_moderators", "nv_pool", "nv_control_range", "nv_budget"]
     ws["settings"] = {key: st.session_state[key] for key in setting_keys if key in st.session_state}
     try:
         if did and (not treatment or policy is None):
