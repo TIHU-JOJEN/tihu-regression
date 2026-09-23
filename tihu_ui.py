@@ -15,7 +15,7 @@ from tihu_core import (VERSION, ModelSpec, apply_steps, binary, candidate_specs,
                        config_payload, fingerprint, fit_model, fixed_sample,
                        grouped_moderation, infer_type,
                        load_config, mechanism_analysis,
-                       mediation_bootstrap, prepare_panel_time, rank_fit, required_columns, unique, effect_row,
+                       mediation_bootstrap, prepare_panel_keys, rank_fit, required_columns, unique, effect_row,
                        validate_panel)
 from tihu_export import dta_bytes, reproducibility_bundle, stata_script
 
@@ -300,10 +300,12 @@ def specification(data):
         with b:
             time_col = choose("时间", cols, "cfg_time", suggested_time)
         try:
-            data = prepare_panel_time(data, time_col)
-            validate_panel(data, entity, time_col)
+            data = prepare_panel_keys(data, entity, time_col)
+            excluded = validate_panel(data, entity, time_col)
         except ValueError as exc:
             st.error(str(exc)); return None
+        if excluded:
+            st.info(f"个体或时间列有 {excluded:,} 行缺失；回归时自动排除这些行，原始数据不变。")
     numeric = list(data.select_dtypes(include="number").columns)
     if structure == "时间序列":
         time_col = choose("时间列", numeric, "cfg_time")

@@ -51,10 +51,25 @@ def esr_identification_candidates(data, y, treatment, candidates, alpha=.05):
 def validate_panel(df, entity, time):
     if not entity or not time or entity == time:
         raise ValueError("请选择不同的个体和时间列")
-    if df[[entity, time]].isna().any().any():
-        raise ValueError("个体或时间列有缺失，请先处理")
-    if df.duplicated([entity, time]).any():
+    keys = prepare_panel_keys(df, entity, time)[[entity, time]].dropna()
+    if keys.empty:
+        raise ValueError("个体和时间列没有共同有效的记录")
+    if keys.duplicated().any():
         raise ValueError("存在重复的个体+时间记录，请在清洗中明确处理；不会自动取平均")
+    return len(df) - len(keys)
+
+
+def prepare_panel_keys(df, entity, time):
+    """Treat blank panel keys as missing in the analysis copy."""
+    result = df
+    for column in (entity, time):
+        if column and column in result:
+            blank = result[column].map(lambda value: isinstance(value, str) and not value.strip())
+            if blank.any():
+                if result is df:
+                    result = df.copy()
+                result.loc[blank, column] = np.nan
+    return prepare_panel_time(result, time)
 
 
 def prepare_panel_time(df, time):
@@ -219,6 +234,8 @@ def frame(data, s):
     if missing:
         raise ValueError("缺少模型变量：" + "、".join(missing))
     d = data.copy().replace([np.inf, -np.inf], np.nan)
+    if s.entity and s.time:
+        d = prepare_panel_keys(d, s.entity, s.time)
     drop = [c for c in need if not (s.model == "Heckman" and c == s.y)]
     d = d.dropna(subset=drop).copy()
     if s.model == "Heckman":

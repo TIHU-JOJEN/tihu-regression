@@ -1,10 +1,13 @@
 """Budget, batching and UI regression checks for expert searches."""
 from collections import Counter
 from dataclasses import replace
+from io import BytesIO
 import unittest
 from unittest.mock import patch
+import zipfile
 
 import numpy as np
+import pandas as pd
 from streamlit.testing.v1 import AppTest
 from test_tihu import cross
 from tihu_core import ModelSpec
@@ -17,6 +20,38 @@ def job_for(data, specs):
 
 
 class ExpertSearchTests(unittest.TestCase):
+    def test_panel_missing_keys_are_reported_and_excluded(self):
+        script = '''import streamlit as st
+from io import BytesIO
+from unittest.mock import patch
+from test_tihu import panel
+from tihu_ui import render_workbench
+d = panel().rename(columns={"id": "participant_id"})
+d["participant_id"] = "P" + d["participant_id"].astype(str)
+d.loc[0, "participant_id"] = ""
+d.loc[1, "year"] = float("nan")
+upload = BytesIO(); d.to_stata(upload, write_index=False); upload.seek(0); upload.name = "missing_keys.dta"
+with patch("streamlit.file_uploader", side_effect=lambda *a, **kw: upload if kw.get("key") == "data_upload" else None):
+    render_workbench()
+'''
+        app = AppTest.from_string(script, default_timeout=60).run()
+        app.selectbox(key="cfg_structure").select("面板").run()
+        self.assertEqual(app.selectbox(key="cfg_entity").value, "participant_id")
+        self.assertIsNotNone(app.selectbox(key="cfg_y"))
+        self.assertTrue(any("2 行缺失" in item.value for item in app.info))
+        app.selectbox(key="cfg_y").select("y").run()
+        app.multiselect(key="cfg_core").set_value(["x"]).run()
+        app.number_input(key="cfg_budget").set_value(1).run()
+        app.button(key="run_search").click().run()
+        self.assertEqual(list(app.exception), [])
+        ws = app.session_state["workspace_v2"]
+        self.assertEqual(len(ws["raw"]), 400)
+        self.assertEqual(len(ws["fits"][0].sample), 398)
+        app.button(key="build_bundle").click().run()
+        with zipfile.ZipFile(BytesIO(ws["bundle"][0])) as archive:
+            rows = pd.read_stata(BytesIO(archive.read("sample.dta")))["__rowid"]
+        self.assertEqual(set(rows.astype(int)), set(ws["fits"][0].sample.index))
+
     def test_switch_from_household_head_to_respondent_id(self):
         script = '''import streamlit as st
 from io import BytesIO

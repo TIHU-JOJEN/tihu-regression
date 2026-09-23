@@ -12,7 +12,7 @@ import pandas as pd
 import streamlit as st
 
 from tihu_core import (ModelSpec, binary, candidate_specs, fingerprint, fit_model,
-                       fixed_sample, mechanism_analysis, prepare_panel_time, unique, validate_panel)
+                       fixed_sample, mechanism_analysis, prepare_panel_keys, unique, validate_panel)
 from tihu_export import reproducibility_bundle, stata_script
 from tihu_ui import choose, multiple, display_table, iv_followup_panel
 
@@ -20,19 +20,24 @@ from tihu_ui import choose, multiple, display_table, iv_followup_panel
 def detect_structure(data):
     time_names = {"year", "time", "wave", "date", "年份", "年度", "时间", "调查年份"}
     id_names = {"id", "pid", "fid", "firmid", "cityid", "code", "个体", "个体id", "城市", "省份", "企业代码", "地区代码", "家庭编号"}
-    times = [c for c in data if c.lower() in time_names and data[c].nunique() > 1
-             and (pd.api.types.is_numeric_dtype(data[c])
-                  or (not pd.api.types.is_datetime64_any_dtype(data[c])
-                      and pd.to_numeric(data[c], errors="coerce")[data[c].notna()].notna().all()))]
+    times = []
+    for column in data:
+        if column.lower() in time_names:
+            try:
+                if prepare_panel_keys(data, "", column)[column].nunique() > 1:
+                    times.append(column)
+            except ValueError:
+                pass
     entities = [c for c in data if c.lower() in id_names or c.lower().endswith("_id")]
     pairs = []
     for entity in entities:
         for time in times:
-            if entity == time or data[entity].nunique() < 2:
+            if entity == time:
                 continue
-            if data.groupby(entity)[time].nunique().max() < 2:
+            complete = prepare_panel_keys(data, entity, time)[[entity, time]].dropna()
+            if complete[entity].nunique() < 2 or complete.groupby(entity)[time].nunique().max() < 2:
                 continue
-            if not data.duplicated([entity, time]).any() and not data[[entity, time]].isna().any().any():
+            if not complete.duplicated().any():
                 pairs.append((entity, time))
     if len(pairs) == 1:
         return "面板", *pairs[0]
@@ -329,11 +334,13 @@ def render_novice():
         with b:
             time = choose("时间列", data.columns, "nv_time", time)
         try:
-            data = prepare_panel_time(data, time)
-            validate_panel(data, entity, time)
+            data = prepare_panel_keys(data, entity, time)
+            excluded = validate_panel(data, entity, time)
         except ValueError as exc:
             st.error(str(exc))
             return
+        if excluded:
+            st.info(f"个体或时间列有 {excluded:,} 行缺失；回归时自动排除这些行，原始数据不变。")
     else:
         entity, time = "", ""
     st.subheader("确定研究变量")

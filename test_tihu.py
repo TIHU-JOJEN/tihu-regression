@@ -132,6 +132,28 @@ with patch("streamlit.file_uploader", side_effect=lambda *a, **kw: upload if kw.
         with self.assertRaises(ValueError):
             validate_panel(bad, "id", "year")
 
+    def test_missing_panel_keys_only_remove_affected_rows(self):
+        d = panel().rename(columns={"id": "participant_id"})
+        d["participant_id"] = "P" + d["participant_id"].astype(str)
+        d.loc[0, "participant_id"] = ""
+        d.loc[1, "participant_id"] = None
+        d.loc[2, "year"] = np.nan
+        s = ModelSpec("FE", "y", ["x"], entity="participant_id", time="year",
+                      se="cluster", cluster="participant_id")
+        self.assertEqual(validate_panel(d, "participant_id", "year"), 3)
+        fitted = fit_model(d, s)
+        expected = fit_model(d.drop(index=[0, 1, 2]), s)
+        self.assertEqual(len(fitted.sample), len(d) - 3)
+        self.assertEqual(fitted.sample.index.tolist(), expected.sample.index.tolist())
+        self.assertAlmostEqual(fitted.effect["coef"], expected.effect["coef"], places=8)
+        self.assertEqual(d.loc[0, "participant_id"], "")
+        self.assertTrue(pd.isna(d.loc[2, "year"]))
+        duplicate = pd.concat([d, d.iloc[[3]]])
+        with self.assertRaisesRegex(ValueError, "重复"):
+            validate_panel(duplicate, "participant_id", "year")
+        with self.assertRaisesRegex(ValueError, "没有共同有效"):
+            validate_panel(d.iloc[[0, 1, 2]], "participant_id", "year")
+
     def test_fe_effect_dimensions(self):
         d = panel()
         names = {c: c for c in d.columns}

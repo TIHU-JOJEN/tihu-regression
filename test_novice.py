@@ -127,6 +127,30 @@ with patch("streamlit.file_uploader", return_value=upload): render_novice()
         self.assertTrue(np.issubdtype(job["data"]["wave_text"].dtype, np.number))
         self.assertEqual(app.session_state["novice_workspace"]["data"]["wave_text"].dtype, object)
 
+    def test_panel_missing_keys_do_not_block_novice(self):
+        script = '''import streamlit as st
+from io import BytesIO
+from unittest.mock import patch
+from test_tihu import panel
+from tihu_novice import render_novice
+d = panel().rename(columns={"id": "participant_id"})
+d["participant_id"] = "P" + d["participant_id"].astype(str)
+d.loc[0, "participant_id"] = ""
+d.loc[1, "year"] = float("nan")
+upload = BytesIO(); d.to_stata(upload, write_index=False); upload.seek(0); upload.name = "missing_keys.dta"
+with patch("streamlit.file_uploader", return_value=upload): render_novice()
+'''
+        app = AppTest.from_string(script, default_timeout=60).run()
+        self.assertEqual(app.radio(key="nv_structure").value, "面板")
+        self.assertTrue(any("2 行缺失" in item.value for item in app.info))
+        app.selectbox(key="nv_y").select("y").run()
+        app.multiselect(key="nv_core").set_value(["x"]).run()
+        app.button(key="nv_run").click().run()
+        self.assertEqual(list(app.exception), [])
+        ws = app.session_state["novice_workspace"]
+        self.assertEqual(len(ws["data"]), 400)
+        self.assertEqual(len(ws["job"]["data"]), 398)
+
     def test_uncertain_detection_does_not_block_manual_panel_choice(self):
         script = '''import streamlit as st
 from io import BytesIO
