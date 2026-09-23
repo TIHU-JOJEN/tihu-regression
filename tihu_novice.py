@@ -12,7 +12,7 @@ import pandas as pd
 import streamlit as st
 
 from tihu_core import (ModelSpec, binary, candidate_specs, fingerprint, fit_model,
-                       fixed_sample, mechanism_analysis, unique, validate_panel)
+                       fixed_sample, mechanism_analysis, prepare_panel_time, unique, validate_panel)
 from tihu_export import reproducibility_bundle, stata_script
 from tihu_ui import choose, multiple, display_table, iv_followup_panel
 
@@ -20,7 +20,10 @@ from tihu_ui import choose, multiple, display_table, iv_followup_panel
 def detect_structure(data):
     time_names = {"year", "time", "wave", "date", "年份", "年度", "时间", "调查年份"}
     id_names = {"id", "pid", "fid", "firmid", "cityid", "code", "个体", "个体id", "城市", "省份", "企业代码", "地区代码", "家庭编号"}
-    times = [c for c in data if c.lower() in time_names and pd.api.types.is_numeric_dtype(data[c]) and data[c].nunique() > 1]
+    times = [c for c in data if c.lower() in time_names and data[c].nunique() > 1
+             and (pd.api.types.is_numeric_dtype(data[c])
+                  or (not pd.api.types.is_datetime64_any_dtype(data[c])
+                      and pd.to_numeric(data[c], errors="coerce")[data[c].notna()].notna().all()))]
     entities = [c for c in data if c.lower() in id_names or c.lower().endswith("_id")]
     pairs = []
     for entity in entities:
@@ -313,20 +316,24 @@ def render_novice():
         st.caption("已载入："+ws.get("name", "本次数据"))
     structure, entity, time = detect_structure(data)
     st.caption(f"{len(data):,} 条记录 · {len(data.columns)} 个变量 · {'需要确认数据结构' if structure == '待确认' else '识别为'+structure+'数据'}")
-    with st.expander("数据与识别结果", expanded=did or structure == "待确认"):
+    with st.expander("数据预览"):
         st.dataframe(data.head(8), hide_index=True, width="stretch")
-        if structure == "待确认" and not did:
-            confirmed = st.radio("这些记录是否来自同一批对象的不同时期？", ["是，重复记录", "否，每条记录是独立对象"], index=None, key="nv_structure_confirm")
-            if confirmed is None:
-                st.info("请确认数据结构后继续。")
-                return
-            structure = "面板" if confirmed.startswith("是") else "横截面"
-        panel = st.checkbox("同一对象在不同时间被重复记录", value=structure == "面板" or did, disabled=did, key="nv_panel")
-        if panel or did:
-            entity = choose("对象编号", data.columns, "nv_entity", entity)
-            time = choose("年份 / 时期", [c for c in data.select_dtypes(include="number") if c != entity], "nv_time", time)
-        else:
-            entity, time = "", ""
+    panel = st.checkbox("按面板数据分析（同一个体跨期记录）", value=structure == "面板" or did,
+                        disabled=did, key="nv_panel") or did
+    if panel:
+        a, b = st.columns(2)
+        with a:
+            entity = choose("个体 ID", data.columns, "nv_entity", entity)
+        with b:
+            time = choose("时间列", [c for c in data if c != entity], "nv_time", time)
+        try:
+            data = prepare_panel_time(data, time)
+            validate_panel(data, entity, time)
+        except ValueError as exc:
+            st.error(str(exc))
+            return
+    else:
+        entity, time = "", ""
     st.subheader("确定研究变量")
     numeric = [c for c in data.select_dtypes(include="number") if c not in {entity, time}]
     if not numeric:
@@ -353,7 +360,7 @@ def render_novice():
         minimum, maximum = st.slider("每组控制变量个数", 0, 10, (0, 10), key="nv_control_range")
         budget = st.number_input("主模型搜索预算（全部核心因素合计）", min_value=1, max_value=10000,
                                  value=10000, step=100, key="nv_budget")
-    setting_keys = ["nv_did", "nv_panel", "nv_structure_confirm", "nv_entity", "nv_time", "nv_y", "nv_treat", "nv_policy", "nv_core", "nv_mediators", "nv_moderators", "nv_pool", "nv_control_range", "nv_budget"]
+    setting_keys = ["nv_did", "nv_panel", "nv_entity", "nv_time", "nv_y", "nv_treat", "nv_policy", "nv_core", "nv_mediators", "nv_moderators", "nv_pool", "nv_control_range", "nv_budget"]
     ws["settings"] = {key: st.session_state[key] for key in setting_keys if key in st.session_state}
     try:
         if did and (not treatment or policy is None):

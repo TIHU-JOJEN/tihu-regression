@@ -57,6 +57,20 @@ def validate_panel(df, entity, time):
         raise ValueError("存在重复的个体+时间记录，请在清洗中明确处理；不会自动取平均")
 
 
+def prepare_panel_time(df, time):
+    """Convert numeric text periods in an analysis copy, leaving uploaded data intact."""
+    if not time or time not in df or pd.api.types.is_numeric_dtype(df[time]):
+        return df
+    if pd.api.types.is_datetime64_any_dtype(df[time]):
+        raise ValueError(f"时间列「{time}」是日期；请先转为数值型年份或时期")
+    converted = pd.to_numeric(df[time], errors="coerce")
+    if converted[df[time].notna()].isna().any():
+        raise ValueError(f"时间列「{time}」含非数值时期；请先转为数值型年份或时期")
+    result = df.copy()
+    result[time] = converted
+    return result
+
+
 def apply_steps(raw, steps):
     work = raw.copy(deep=True)
     audit = []

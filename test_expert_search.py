@@ -17,6 +17,59 @@ def job_for(data, specs):
 
 
 class ExpertSearchTests(unittest.TestCase):
+    def test_panel_columns_can_be_changed_to_numeric_text_time(self):
+        script = '''import streamlit as st
+from test_tihu import panel
+from tihu_ui import specification
+d = panel()
+d["firm_code"] = "F" + d["id"].astype(str)
+d["wave_text"] = d["year"].astype(str)
+st.session_state["test_result"] = specification(d)
+'''
+        app = AppTest.from_string(script, default_timeout=60).run()
+        app.selectbox(key="cfg_structure").select("面板").run()
+        self.assertEqual((app.selectbox(key="cfg_entity").value,
+                          app.selectbox(key="cfg_time").value), ("id", "year"))
+        app.selectbox(key="cfg_entity").select("firm_code").run()
+        app.selectbox(key="cfg_time").select("wave_text").run()
+        self.assertEqual(list(app.exception), [])
+        spec, _, prepared = app.session_state["test_result"]
+        self.assertEqual((spec.entity, spec.time), ("firm_code", "wave_text"))
+        self.assertTrue(np.issubdtype(prepared["wave_text"].dtype, np.number))
+
+    def test_text_time_is_recorded_in_expert_replay(self):
+        script = '''import streamlit as st
+from io import BytesIO
+from unittest.mock import patch
+from test_tihu import panel
+from tihu_ui import render_workbench
+d = panel()
+d["firm_code"] = "F" + d["id"].astype(str)
+d["wave_text"] = d["year"].astype(str)
+d["bad_time"] = "not a period"
+upload = BytesIO(); d.to_stata(upload, write_index=False); upload.seek(0); upload.name = "synthetic_panel.dta"
+with patch("streamlit.file_uploader", side_effect=lambda *a, **kw: upload if kw.get("key") == "data_upload" else None):
+    render_workbench()
+'''
+        app = AppTest.from_string(script, default_timeout=60).run()
+        app.selectbox(key="cfg_structure").select("面板").run()
+        app.selectbox(key="cfg_entity").select("firm_code").run()
+        app.selectbox(key="cfg_time").select("wave_text").run()
+        app.selectbox(key="cfg_y").select("y").run()
+        app.multiselect(key="cfg_core").set_value(["x"]).run()
+        app.number_input(key="cfg_budget").set_value(1).run()
+        app.button(key="run_search").click().run()
+        ws = app.session_state["workspace_v2"]
+        self.assertEqual(ws["job"]["export_steps"], [{"op": "numeric", "cols": ["wave_text"]}])
+        self.assertEqual(list(app.exception), [])
+        app.button(key="build_bundle").click().run()
+        self.assertIn("bundle", app.session_state["workspace_v2"])
+        _, do = app.session_state["workspace_v2"]["bundle"]
+        self.assertIn("destring", do)
+        app.selectbox(key="cfg_time").select("bad_time").run()
+        self.assertNotIn("job", app.session_state["workspace_v2"])
+        self.assertNotIn("fits", app.session_state["workspace_v2"])
+
     def test_budget_counts_each_x_once(self):
         spec = ModelSpec("OLS", "y", ["x", "z", "m"], controls=["required"])
         pool = [f"c{i}" for i in range(20)]

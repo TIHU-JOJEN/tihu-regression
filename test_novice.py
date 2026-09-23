@@ -12,6 +12,7 @@ import numpy as np
 from streamlit.testing.v1 import AppTest
 
 from test_tihu import cross, panel
+from tihu_core import prepare_panel_time
 from tihu_novice import (detect_structure, basic_spec, start_job, advance_job,
                          full_bundle)
 
@@ -98,6 +99,59 @@ with patch("streamlit.file_uploader", return_value=upload): render_novice()
         self.assertEqual(basic_spec(cross(), "binary", ["x"]).model, "Probit")
         self.assertEqual(basic_spec(panel(), "y", ["x"], "id", "year").model, "FE")
         self.assertEqual(basic_spec(panel(), "y", [], "id", "year", True, "D", 2017).model, "DID")
+
+    def test_manual_panel_columns_and_numeric_text_time(self):
+        script = '''import streamlit as st
+from io import BytesIO
+from unittest.mock import patch
+from test_tihu import panel
+from tihu_novice import render_novice
+d = panel()
+d["firm_code"] = "F" + d["id"].astype(str)
+d["wave_text"] = d["year"].astype(str)
+upload = BytesIO(); d.to_stata(upload, write_index=False); upload.seek(0); upload.name = "synthetic_panel.dta"
+with patch("streamlit.file_uploader", return_value=upload): render_novice()
+'''
+        app = AppTest.from_string(script, default_timeout=60).run()
+        self.assertEqual(detect_structure(panel()), ("面板", "id", "year"))
+        self.assertEqual(app.selectbox(key="nv_entity").value, "id")
+        self.assertIn("wave_text", app.selectbox(key="nv_time").options)
+        app.selectbox(key="nv_entity").select("firm_code").run()
+        app.selectbox(key="nv_time").select("wave_text").run()
+        app.selectbox(key="nv_y").select("y").run()
+        app.multiselect(key="nv_core").set_value(["x"]).run()
+        app.button(key="nv_run").click().run()
+        self.assertEqual(list(app.exception), [])
+        job = app.session_state["novice_workspace"]["job"]
+        self.assertEqual((job["specs"][0].entity, job["specs"][0].time), ("firm_code", "wave_text"))
+        self.assertTrue(np.issubdtype(job["data"]["wave_text"].dtype, np.number))
+        self.assertEqual(app.session_state["novice_workspace"]["data"]["wave_text"].dtype, object)
+
+    def test_uncertain_detection_does_not_block_manual_panel_choice(self):
+        script = '''import streamlit as st
+from io import BytesIO
+from unittest.mock import patch
+from test_tihu import panel
+from tihu_novice import render_novice
+d = panel()
+d["period_code"] = d["year"]
+d.loc[1, "year"] = d.loc[0, "year"]
+upload = BytesIO(d.to_csv(index=False).encode()); upload.name = "ambiguous.csv"
+with patch("streamlit.file_uploader", return_value=upload): render_novice()
+'''
+        app = AppTest.from_string(script, default_timeout=60).run()
+        self.assertEqual(app.checkbox(key="nv_panel").value, False)
+        app.checkbox(key="nv_panel").check().run()
+        app.selectbox(key="nv_time").select("period_code").run()
+        self.assertEqual(list(app.exception), [])
+        self.assertIsNotNone(app.selectbox(key="nv_y"))
+
+    def test_panel_time_conversion_keeps_upload_unchanged(self):
+        d = panel()
+        d["text_year"] = d["year"].astype(str)
+        prepared = prepare_panel_time(d, "text_year")
+        self.assertTrue(np.issubdtype(prepared["text_year"].dtype, np.number))
+        self.assertEqual(d["text_year"].dtype, object)
 
     def test_complete_search_and_bundle(self):
         d = cross()

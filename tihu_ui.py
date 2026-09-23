@@ -15,7 +15,7 @@ from tihu_core import (VERSION, ModelSpec, apply_steps, binary, candidate_specs,
                        config_payload, fingerprint, fit_model, fixed_sample,
                        grouped_moderation, infer_type,
                        load_config, mechanism_analysis,
-                       mediation_bootstrap, rank_fit, required_columns, unique, effect_row,
+                       mediation_bootstrap, prepare_panel_time, rank_fit, required_columns, unique, effect_row,
                        validate_panel)
 from tihu_export import dta_bytes, reproducibility_bundle, stata_script
 
@@ -289,19 +289,22 @@ def pipeline_panel(ws, raw):
 def specification(data):
     st.subheader("2 · 数据结构与模型")
     cols = list(data.columns)
-    numeric = list(data.select_dtypes(include="number").columns)
     structure = choose("数据结构", ["横截面", "面板", "时间序列"], "cfg_structure")
     entity = time_col = ""
     if structure == "面板":
+        suggested_entity = next((c for c in cols if c.lower() in {"id", "pid", "fid", "firmid", "cityid", "个体", "个体id", "企业代码", "地区代码"} or c.lower().endswith("_id")), None)
+        suggested_time = next((c for c in cols if c.lower() in {"year", "time", "wave", "date", "年份", "年度", "时间", "调查年份"}), None)
         a, b = st.columns(2)
         with a:
-            entity = choose("个体 ID", cols, "cfg_entity")
+            entity = choose("个体 ID", cols, "cfg_entity", suggested_entity)
         with b:
-            time_col = choose("时间", [c for c in numeric if c != entity], "cfg_time")
+            time_col = choose("时间", [c for c in cols if c != entity], "cfg_time", suggested_time)
         try:
+            data = prepare_panel_time(data, time_col)
             validate_panel(data, entity, time_col)
         except ValueError as exc:
             st.error(str(exc)); return None
+    numeric = list(data.select_dtypes(include="number").columns)
     if structure == "时间序列":
         time_col = choose("时间列", numeric, "cfg_time")
         time_series_ui(data, time_col)
@@ -449,7 +452,7 @@ def specification(data):
         s.se = mapping[se_label]
         if s.se == "cluster":
             s.cluster = choose("聚类列", [c for c in cols if c != y], "cfg_cluster", entity)
-    return s, pool
+    return s, pool, data
 
 
 def expert_specs(s, pool, minimum, maximum, budget, joint=True):
@@ -514,7 +517,7 @@ def search_tick(ws):
         st.rerun()
 
 
-def search_controls(ws, data, s, pool):
+def search_controls(ws, data, s, pool, export_steps=None):
     st.subheader("3 · 估计与组合搜索")
     pool = [col for col in unique(pool) if col not in s.controls+s.core]
     a, b, c = st.columns(3)
@@ -554,7 +557,8 @@ def search_controls(ws, data, s, pool):
             invalidate(ws)
             ws["job"] = {"data": search_data, "specs": specs, "index": 0, "fits": [], "failures": {},
                          "joint": joint, "done": False, "cancelled": False, "records": [],
-                         "elapsed": 0., "signature": signature}
+                         "elapsed": 0., "signature": signature,
+                         "export_steps": list(export_steps if export_steps is not None else ws.get("steps", []))}
         except Exception as e:
             st.error(str(e))
     job = ws.get("job")
@@ -742,6 +746,7 @@ def results_ui(ws, raw):
     result_number = choose("选定结果", range(1, len(fits)+1), "selected_result")
     idx = result_number-1
     fit = fits[idx]
+    export_steps = ws.get("job", {}).get("export_steps", ws.get("steps", []))
     token = fingerprint(json.dumps(asdict(fit.spec), sort_keys=True, default=str).encode())
     if ws.get("selected_token") != token:
         ws["selected_token"] = token
@@ -755,14 +760,14 @@ def results_ui(ws, raw):
         elif key not in {"pairs", "ps"}:
             st.caption(f"{key}: {value}")
     try:
-        do, _ = stata_script(raw, ws.get("steps", []), fit)
+        do, _ = stata_script(raw, export_steps, fit)
         with st.expander("Stata 复现代码"):
             st.code(do, language="stata")
     except Exception as e:
         st.warning(f"Stata 代码暂时无法生成：{e}")
     if st.button("生成完整复现文件包", icon=":material/download:", key="build_bundle"):
         try:
-            ws["bundle"] = reproducibility_bundle(raw, ws.get("steps", []), fit, ws["hash"])
+            ws["bundle"] = reproducibility_bundle(raw, export_steps, fit, ws["hash"])
         except Exception as e:
             st.error(f"导出失败：{e}")
     if ws.get("bundle"):
@@ -961,10 +966,16 @@ def render_workbench():
             except Exception as e:
                 st.error(str(e))
     data = pipeline_panel(ws, raw)
+    cleaned_data = data
     result = specification(data)
     if result:
-        s, pool = result
-        search_controls(ws, data, s, pool)
+        s, pool, data = result
+        export_steps = list(ws.get("steps", []))
+        if s.entity and not pd.api.types.is_numeric_dtype(cleaned_data[s.time]) and pd.api.types.is_numeric_dtype(data[s.time]):
+            export_steps.append({"op": "numeric", "cols": [s.time]})
+        search_controls(ws, data, s, pool, export_steps)
+    elif st.session_state.get("cfg_structure") == "面板":
+        invalidate(ws)
     settings = {k: v for k, v in st.session_state.items() if k.startswith("cfg_")}
     payload = config_payload(digest, ws.get("steps", []), settings)
     with st.sidebar:
